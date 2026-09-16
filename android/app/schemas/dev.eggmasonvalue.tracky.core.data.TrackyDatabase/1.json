@@ -1,0 +1,189 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 1,
+    "identityHash": "c08b092527b950469f1bbfeafea64d90",
+    "entities": [
+      {
+        "tableName": "sessions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `status` TEXT NOT NULL, `started_at_epoch_ms` INTEGER NOT NULL, `ended_at_epoch_ms` INTEGER, `requested_display_unit` TEXT NOT NULL, `safe_advertised_name` TEXT NOT NULL, `selected_frame_sequence` INTEGER, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "startedAt",
+            "columnName": "started_at_epoch_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "endedAt",
+            "columnName": "ended_at_epoch_ms",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "requestedDisplayUnit",
+            "columnName": "requested_display_unit",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "safeAdvertisedName",
+            "columnName": "safe_advertised_name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "selectedFrameSequence",
+            "columnName": "selected_frame_sequence",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_sessions_started_at",
+            "unique": false,
+            "columnNames": [
+              "started_at_epoch_ms"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sessions_started_at` ON `${TABLE_NAME}` (`started_at_epoch_ms`)"
+          }
+        ]
+      },
+      {
+        "tableName": "raw_frames",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`session_id` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `observed_at_epoch_ms` INTEGER NOT NULL, `elapsed_ms` INTEGER NOT NULL, `direction` TEXT NOT NULL, `characteristic_uuid` TEXT NOT NULL, `raw_bytes` BLOB NOT NULL, `opcode` INTEGER, `checksum` INTEGER, `frame_kind` TEXT, `decode_error` TEXT, `measurement_raw_u16` INTEGER, `measurement_divisor` INTEGER, `measurement_b5` INTEGER, `measurement_b6` INTEGER, `measurement_resistance_values` BLOB, PRIMARY KEY(`session_id`, `sequence`), FOREIGN KEY(`session_id`) REFERENCES `sessions`(`id`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "sessionId",
+            "columnName": "session_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sequence",
+            "columnName": "sequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "observedAt",
+            "columnName": "observed_at_epoch_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "elapsedMs",
+            "columnName": "elapsed_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "direction",
+            "columnName": "direction",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "characteristicUuid",
+            "columnName": "characteristic_uuid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "raw",
+            "columnName": "raw_bytes",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "opcode",
+            "columnName": "opcode",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "checksum",
+            "columnName": "checksum",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "frameKind",
+            "columnName": "frame_kind",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "decodeError",
+            "columnName": "decode_error",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "measurementRawU16",
+            "columnName": "measurement_raw_u16",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "measurementDivisor",
+            "columnName": "measurement_divisor",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "measurementB5",
+            "columnName": "measurement_b5",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "measurementB6",
+            "columnName": "measurement_b6",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "measurementResistanceValues",
+            "columnName": "measurement_resistance_values",
+            "affinity": "BLOB"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "session_id",
+            "sequence"
+          ]
+        },
+        "foreignKeys": [
+          {
+            "table": "sessions",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "session_id"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'c08b092527b950469f1bbfeafea64d90')"
+    ]
+  }
+}
