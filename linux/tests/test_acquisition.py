@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tracky_mcp.acquisition import AcquisitionService, WeighInRequest
 from tracky_mcp.ble import FFF1_NOTIFY_UUID, FFF2_WRITE_UUID, WireEvent, WireObserver
-from tracky_mcp.protocol import DecodedFrame, build_unit_config, decode_frame
+from tracky_mcp.protocol import (
+    DecodedFrame,
+    MeasurementQuality,
+    build_unit_config,
+    decode_frame,
+)
 from tracky_mcp.storage import OperationStatus, SessionStatus, SQLiteMeasurementStore
 
 NOW = datetime(2026, 8, 11, 16, 0, tzinfo=timezone.utc)
@@ -75,6 +81,38 @@ class CapturingFactory:
     ) -> BlockingWireClient:
         self.client = BlockingWireClient(observer, fail=self.fail)
         return self.client
+
+
+class StableFixtureClient:
+    def __init__(self, observer: WireObserver, frames: list[bytes]) -> None:
+        self.observer = observer
+        self.frames = frames
+        self.disconnect_calls = 0
+
+    async def events(self) -> AsyncIterator[DecodedFrame]:
+        for index, raw in enumerate(self.frames):
+            self.observer(
+                WireEvent(
+                    NOW + timedelta(milliseconds=index),
+                    "rx",
+                    FFF1_NOTIFY_UUID,
+                    raw,
+                )
+            )
+            yield decode_frame(raw)
+            if len(raw) == 18 and raw[5:7] == bytes((0x01, 0x21)):
+                self.observer(
+                    WireEvent(
+                        NOW + timedelta(milliseconds=index, microseconds=100),
+                        "tx",
+                        FFF2_WRITE_UUID,
+                        bytes.fromhex("1f0620102176"),
+                    )
+                )
+        await asyncio.Event().wait()
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
 
 
 async def _wait_until_ready(factory: CapturingFactory) -> BlockingWireClient:
@@ -228,3 +266,57 @@ def test_operation_handle_survives_store_reopen(tmp_path: Path) -> None:
     assert operation.kind == "weigh_in"
     assert operation.status is OperationStatus.CANCELLED
     assert operation.metadata == {"scope": "weigh_in"}
+
+
+def test_stable_fixture_completes_before_safety_timeout_and_persists_quality(
+    tmp_path: Path,
+) -> None:
+    fixture_path = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "cs10b"
+        / "conditions"
+        / "handle_contact_complete.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    frames = [bytes.fromhex(raw) for raw in fixture["notifications"]]
+
+    async def scenario() -> None:
+        factory_client: StableFixtureClient | None = None
+
+        def factory(_request: WeighInRequest, observer: WireObserver) -> StableFixtureClient:
+            nonlocal factory_client
+            factory_client = StableFixtureClient(observer, frames)
+            return factory_client
+
+        with SQLiteMeasurementStore(tmp_path / "tracky.sqlite3") as store:
+            service = AcquisitionService(store, client_factory=factory, clock=FixedClock())
+            operation_id = service.start(
+                WeighInRequest(
+                    device=object(),
+                    timeout_seconds=0.5,
+                    completion_idle_seconds=0.01,
+                    stable_measurements=3,
+                )
+            )
+            operation = await service.wait(operation_id)
+            session = service.get_session(operation_id)
+
+        assert factory_client is not None
+        assert operation.status is OperationStatus.COMPLETE
+        assert session is not None
+        assert session.status is SessionStatus.COMPLETE
+        assert session.quality is MeasurementQuality.ACCEPTED
+        assert session.quality_reason == "stable_complete_word_burst"
+        assert session.completion_reason == "stable_complete_word_burst"
+        assert session.selected_frame_sequence is not None
+        assert session.selection_policy_version == 1
+        assert session.selected_frame is not None
+        assert session.selected_frame.measurement is not None
+        assert session.selected_frame.measurement.weight_raw_u16_be == 5000
+        # All packet-2 frames were consumed before the configured idle grace
+        # ended capture; a burst decision did not bypass that grace period.
+        assert len(session.frames) == len(frames) + 3
+        assert factory_client.disconnect_calls >= 1
+
+    asyncio.run(scenario())

@@ -9,6 +9,8 @@ from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from tracky_mcp.protocol import QUALITY_VERSION, MeasurementQuality
+
 
 class SessionStatus(str, Enum):
     """Lifecycle of one locally recorded scale interaction."""
@@ -96,10 +98,10 @@ class StoredMeasurement:
     weight_provenance: str
     b5: int
     b6: int
-    resistance_raw: tuple[int, ...]
-    resistance_layout: str | None
-    resistance_unit: str | None
-    resistance_provenance: str
+    word_block: tuple[int, ...]
+    word_layout: str | None
+    word_provenance: str
+    opaque_unit_evidence: str | None
 
     @property
     def weight_kg(self) -> Decimal:
@@ -132,6 +134,55 @@ class StoredFrame:
 
 
 @dataclass(frozen=True, slots=True)
+class MeasurementSessionSummary:
+    """Session metadata and aggregate evidence counts without frame bodies.
+
+    This is the read-optimized record used by history listings and session
+    metadata reads.  The canonical frame stream remains available through
+    :meth:`SQLiteMeasurementStore.get_session`, but callers that only need a
+    summary never materialize it.
+    """
+
+    id: str
+    status: SessionStatus
+    started_at: datetime
+    ended_at: datetime | None
+    display_timezone: str
+    device_alias: str | None
+    model_label: str | None
+    address_hash: str | None
+    requested_unit: str | None
+    condition: str | None
+    capture_id: str | None
+    metadata: dict[str, Any]
+    quality: MeasurementQuality
+    quality_version: int
+    quality_reason: str | None
+    completion_reason: str | None
+    selected_frame_sequence: int | None
+    selection_policy_version: int | None
+    frame_count: int
+    measurement_frame_count: int
+    decoder_versions: tuple[int, ...]
+
+    @property
+    def decoder_version(self) -> int | None:
+        """Return one decoder version only when the session is uniform."""
+
+        return self.decoder_versions[0] if len(self.decoder_versions) == 1 else None
+
+    @property
+    def started_at_local(self) -> datetime:
+        return self.started_at.astimezone(ZoneInfo(self.display_timezone))
+
+    @property
+    def ended_at_local(self) -> datetime | None:
+        if self.ended_at is None:
+            return None
+        return self.ended_at.astimezone(ZoneInfo(self.display_timezone))
+
+
+@dataclass(frozen=True, slots=True)
 class MeasurementSession:
     """A complete or in-progress weigh-in session.
 
@@ -152,8 +203,13 @@ class MeasurementSession:
     condition: str | None
     capture_id: str | None
     metadata: dict[str, Any]
-    selected_frame_sequence: int | None
-    frames: tuple[StoredFrame, ...]
+    quality: MeasurementQuality
+    quality_version: int = QUALITY_VERSION
+    quality_reason: str | None = None
+    completion_reason: str | None = None
+    selected_frame_sequence: int | None = None
+    selection_policy_version: int | None = None
+    frames: tuple[StoredFrame, ...] = ()
 
     @property
     def started_at_local(self) -> datetime:
@@ -183,6 +239,7 @@ __all__ = [
     "DeviceConnection",
     "KnownDevice",
     "MeasurementSession",
+    "MeasurementSessionSummary",
     "OperationStatus",
     "SessionStatus",
     "StoredFrame",

@@ -6,7 +6,7 @@
   "weight_formula": "int.from_bytes(frame[3:5], 'big') / 100",
   "weight_kg": 78.9,
   "confidence": "high",
-  "resistance_raw": [
+  "opaque_words": [
     4549,
     4215,
     2190,

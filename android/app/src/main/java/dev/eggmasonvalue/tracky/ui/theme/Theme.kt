@@ -3,6 +3,7 @@
 package dev.eggmasonvalue.tracky.ui.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialExpressiveTheme
 import androidx.compose.material3.MotionScheme
 import androidx.compose.material3.Shapes
@@ -15,27 +16,28 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.sp
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import dev.eggmasonvalue.tracky.R
 
 private val TrackyLightColors = lightColorScheme(
     primary = Color(0xFF405D44),
-    onPrimary = Color(0xFFFFFFFF),
+    onPrimary = Color.White,
     primaryContainer = Color(0xFFC2E9C5),
     onPrimaryContainer = Color(0xFF0B3515),
     secondary = Color(0xFF506352),
-    onSecondary = Color(0xFFFFFFFF),
+    onSecondary = Color.White,
     secondaryContainer = Color(0xFFD3E8D2),
     onSecondaryContainer = Color(0xFF172B1B),
     tertiary = Color(0xFF39656B),
-    onTertiary = Color(0xFFFFFFFF),
+    onTertiary = Color.White,
     tertiaryContainer = Color(0xFFBCEBF1),
     onTertiaryContainer = Color(0xFF002F34),
     error = Color(0xFFBA1A1A),
-    onError = Color(0xFFFFFFFF),
+    onError = Color.White,
     errorContainer = Color(0xFFFFDAD6),
     onErrorContainer = Color(0xFF410002),
     background = Color(0xFFF7FBF3),
@@ -81,6 +83,9 @@ private val TrackyDarkColors = darkColorScheme(
     inversePrimary = Color(0xFF405D44),
 )
 
+private val GoogleSansFlex = FontFamily(
+    Font(R.font.google_sans_flex, FontWeight.Normal),
+)
 private val TrackyShapes = Shapes(
     extraSmall = RoundedCornerShape(8.dp),
     small = RoundedCornerShape(14.dp),
@@ -88,35 +93,28 @@ private val TrackyShapes = Shapes(
     large = RoundedCornerShape(30.dp),
     extraLarge = RoundedCornerShape(40.dp),
 )
-
 private val BaseTypography = Typography()
-
 private val TrackyTypography = Typography(
     displayLarge = BaseTypography.displayLarge.merge(
-        TextStyle(
-            fontFamily = FontFamily.SansSerif,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 64.sp,
-            lineHeight = 68.sp,
-            letterSpacing = (-1.5).sp,
-        ),
+        TextStyle(fontFamily = GoogleSansFlex, fontWeight = FontWeight.SemiBold, fontSize = 64.sp),
     ),
     headlineLarge = BaseTypography.headlineLarge.merge(
-        TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold),
+        TextStyle(fontFamily = GoogleSansFlex, fontWeight = FontWeight.SemiBold),
     ),
     headlineMedium = BaseTypography.headlineMedium.merge(
-        TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold),
+        TextStyle(fontFamily = GoogleSansFlex, fontWeight = FontWeight.SemiBold),
     ),
     titleLarge = BaseTypography.titleLarge.merge(
-        TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold),
+        TextStyle(fontFamily = GoogleSansFlex, fontWeight = FontWeight.SemiBold),
     ),
     titleMedium = BaseTypography.titleMedium.merge(
-        TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Medium),
+        TextStyle(fontFamily = GoogleSansFlex, fontWeight = FontWeight.Medium),
     ),
-    bodyLarge = BaseTypography.bodyLarge.merge(TextStyle(fontFamily = FontFamily.SansSerif)),
-    bodyMedium = BaseTypography.bodyMedium.merge(TextStyle(fontFamily = FontFamily.SansSerif)),
+    bodyLarge = BaseTypography.bodyLarge.merge(TextStyle(fontFamily = GoogleSansFlex)),
+    bodyMedium = BaseTypography.bodyMedium.merge(TextStyle(fontFamily = GoogleSansFlex)),
+    bodySmall = BaseTypography.bodySmall.merge(TextStyle(fontFamily = GoogleSansFlex)),
     labelLarge = BaseTypography.labelLarge.merge(
-        TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold),
+        TextStyle(fontFamily = GoogleSansFlex, fontWeight = FontWeight.SemiBold),
     ),
 )
 
@@ -128,15 +126,10 @@ fun TrackyTheme(
 ) {
     val context = LocalContext.current
     val colorScheme = when {
-        dynamicColor -> if (darkTheme) {
-            dynamicDarkColorScheme(context)
-        } else {
-            dynamicLightColorScheme(context)
-        }
+        dynamicColor -> if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         darkTheme -> TrackyDarkColors
         else -> TrackyLightColors
     }
-
     MaterialExpressiveTheme(
         colorScheme = colorScheme,
         motionScheme = MotionScheme.expressive(),

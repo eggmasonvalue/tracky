@@ -2,8 +2,8 @@
 
 Only fields supported by the sanitized capture are turned into named values.
 Unknown bytes remain available through ``raw``/``raw_hex`` and opaque payload
-properties; in particular, the five values in a resistance-bearing frame are
-not assigned an ohm unit or a body-composition meaning here.
+properties.  The five-word blocks are retained as opaque wire evidence; this
+module does not assign electrical units, channels, or body-composition meaning.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ from .frames import CHECKSUM_BEARING_OPCODES, Opcode
 # Captured interpretations are tagged with these values when persisted. A
 # version change means the same immutable bytes may receive a new decoding;
 # it is scientific provenance, not a package compatibility promise.
-DECODER_ID = "tracky-cs10b-capture-layout"
-DECODER_VERSION = 1
+DECODER_ID = "tracky-cs10b-opaque-layout"
+DECODER_VERSION = 2
 
 
 class FrameDecodeError(ValueError):
@@ -81,6 +81,17 @@ class DecodedFrame:
         return self.checksum_valid
 
     @property
+    def wire_valid(self) -> bool:
+        """Whether this decoded known frame passed its wire-level check.
+
+        A frame with no checksum is valid only when its opcode-specific shape
+        was accepted by :func:`decode_frame`.  Unknown frames remain retained
+        as evidence but are not eligible for burst assembly.
+        """
+
+        return self.checksum_valid is not False
+
+    @property
     def payload(self) -> bytes:
         """Bytes after the opcode, excluding a known checksum trailer."""
 
@@ -128,7 +139,13 @@ class StatusFrame(DecodedFrame):
 
 @dataclass(slots=True)
 class MeasurementFrame(DecodedFrame):
-    """Observed 18-byte ``0x10`` live measurement notification."""
+    """Observed 18-byte ``0x10`` live measurement notification.
+
+    ``word_block`` contains five consecutive big-endian words when the
+    observed block marker is present.  The words are deliberately opaque: the
+    decoder does not assign units, frequencies, channels, or physiological
+    meaning to them.
+    """
 
     protocol_type: int
     weight_raw_u16_be: int
@@ -137,126 +154,29 @@ class MeasurementFrame(DecodedFrame):
     weight_provenance: str
     b5: int
     b6: int
-    resistance_raw: list[int]
-    resistance_layout: str | None
+    word_block: list[int]
+    word_layout: str | None
     weight_unit: str = "kg"
     weight_scale_divisor: int = 100
-    resistance_unit: str | None = None
-    resistance_provenance: str = (
-        "Opaque five-value block; field boundaries are observed, but units, "
-        "frequencies, and segment meaning are unproven."
+    word_provenance: str = (
+        "Opaque five-word block; boundaries are observed, but units, "
+        "frequencies, ordering, and physical meaning are unproven."
     )
+    opaque_unit_evidence: str | None = None
 
     @property
     def weight_raw(self) -> int:
         return self.weight_raw_u16_be
 
     @property
-    def has_resistance(self) -> bool:
-        return bool(self.resistance_raw)
+    def has_word_block(self) -> bool:
+        return bool(self.word_block)
 
     @property
-    def resistance_values(self) -> list[int]:
-        """Alias preserving the intentionally unitless raw values."""
+    def opaque_words(self) -> list[int]:
+        """Return a copy of the block without assigning it a physical type."""
 
-        return self.resistance_raw
-
-
-@dataclass(slots=True, frozen=True)
-class SegmentalBioimpedance:
-    """Reassembled 10-channel dual-frequency bioimpedance burst.
-
-    Channels represent raw uint16 values across 5 body segments at 20 kHz and
-    100 kHz. Electrical scaling is 0.1 Ohms per raw count.
-    """
-
-    lf20k: int
-    lf100k: int
-    rf20k: int
-    rf100k: int
-    lh20k: int
-    lh100k: int
-    rh20k: int
-    rh100k: int
-    t20k: int
-    t100k: int
-    weight_kg: float = 0.0
-
-    @property
-    def raw_channels(self) -> list[int]:
-        return [
-            self.lf20k,
-            self.lf100k,
-            self.rf20k,
-            self.rf100k,
-            self.lh20k,
-            self.lh100k,
-            self.rh20k,
-            self.rh100k,
-            self.t20k,
-            self.t100k,
-        ]
-
-    @property
-    def ohms(self) -> dict[str, float]:
-        """Convert raw counts to Ohms (0.1 Ohm per count)."""
-        return {
-            "lf20k": round(self.lf20k * 0.1, 1),
-            "lf100k": round(self.lf100k * 0.1, 1),
-            "rf20k": round(self.rf20k * 0.1, 1),
-            "rf100k": round(self.rf100k * 0.1, 1),
-            "lh20k": round(self.lh20k * 0.1, 1),
-            "lh100k": round(self.lh100k * 0.1, 1),
-            "rh20k": round(self.rh20k * 0.1, 1),
-            "rh100k": round(self.rh100k * 0.1, 1),
-            "t20k": round(self.t20k * 0.1, 1),
-            "t100k": round(self.t100k * 0.1, 1),
-        }
-
-    @property
-    def fluid_ratio(self) -> float | None:
-        """Dual-frequency fluid ratio: sum(Z_100k) / sum(Z_20k)."""
-        sum_20k = self.lf20k + self.rf20k + self.lh20k + self.rh20k + self.t20k
-        sum_100k = self.lf100k + self.rf100k + self.lh100k + self.rh100k + self.t100k
-        if sum_20k == 0:
-            return None
-        return round(sum_100k / sum_20k, 4)
-
-
-def reassemble_burst(
-    packet1: MeasurementFrame,
-    packet2: MeasurementFrame,
-) -> SegmentalBioimpedance:
-    """Combine Packet 1 (b6=0x21) and Packet 2 (b6=0x22) into a 10-channel burst."""
-    if packet1.b5 != 0x01 or packet1.b6 != 0x21:
-        raise ValueError(
-            f"packet1 must have b5=0x01 and b6=0x21, got "
-            f"b5=0x{packet1.b5:02x}, b6=0x{packet1.b6:02x}"
-        )
-    if packet2.b5 != 0x01 or packet2.b6 != 0x22:
-        raise ValueError(
-            f"packet2 must have b5=0x01 and b6=0x22, got "
-            f"b5=0x{packet2.b5:02x}, b6=0x{packet2.b6:02x}"
-        )
-    if len(packet1.resistance_raw) != 5 or len(packet2.resistance_raw) != 5:
-        raise ValueError("both packet1 and packet2 must contain 5 raw resistance values")
-
-    p1 = packet1.resistance_raw
-    p2 = packet2.resistance_raw
-
-    return SegmentalBioimpedance(
-        lf20k=p1[0],
-        lf100k=p1[1],
-        rf20k=p1[2],
-        rf100k=p1[3],
-        lh20k=p1[4],
-        lh100k=p2[0],
-        rh20k=p2[1],
-        rh100k=p2[2],
-        t20k=p2[3],
-        t100k=p2[4],
-        weight_kg=packet2.weight_kg if packet2.weight_kg > 0 else packet1.weight_kg,
-    )
+        return list(self.word_block)
 
 
 @dataclass(slots=True)
@@ -330,19 +250,19 @@ def decode_frame(frame: FrameInput) -> DecodedFrame:
         b5 = raw[5]
         b6 = raw[6]
         has_block = b5 == 0x01 and b6 in (0x21, 0x22)
-        resistance_raw = (
+        word_block = (
             [int.from_bytes(raw[index : index + 2], "big") for index in range(7, 17, 2)]
             if has_block
             else []
         )
         if has_block:
-            resistance_layout = (
-                "packet 1/2: lf20k, lf100k, rf20k, rf100k, lh20k"
+            word_layout = (
+                "packet 1/2: five consecutive big-endian words at bytes 7..16"
                 if b6 == 0x21
-                else "packet 2/2: lh100k, rh20k, rh100k, t20k, t100k"
+                else "packet 2/2: five consecutive big-endian words at bytes 7..16"
             )
         else:
-            resistance_layout = None
+            word_layout = None
         return MeasurementFrame(
             raw=raw,
             opcode=opcode,
@@ -357,8 +277,8 @@ def decode_frame(frame: FrameInput) -> DecodedFrame:
             ),
             b5=b5,
             b6=b6,
-            resistance_raw=resistance_raw,
-            resistance_layout=resistance_layout,
+            word_block=word_block,
+            word_layout=word_layout,
         )
 
     if opcode == Opcode.INFO:
@@ -462,9 +382,7 @@ __all__ = [
     "FrameInput",
     "InfoFrame",
     "MeasurementFrame",
-    "SegmentalBioimpedance",
     "StatusFrame",
     "UnknownFrame",
     "decode_frame",
-    "reassemble_burst",
 ]

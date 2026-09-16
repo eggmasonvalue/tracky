@@ -13,14 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
+from .burst import BurstAssembler, OpaqueBurst
 from .decode import (
     DecodedFrame,
     InfoFrame,
     MeasurementFrame,
-    SegmentalBioimpedance,
     StatusFrame,
     decode_frame,
-    reassemble_burst,
 )
 from .frames import (
     Opcode,
@@ -90,8 +89,8 @@ class ScaleSession:
         self.configured = False
         self.received_events: list[DecodedFrame] = []
         self.measurements: list[MeasurementFrame] = []
-        self._pending_packet1: MeasurementFrame | None = None
-        self.bursts: list[SegmentalBioimpedance] = []
+        self._burst_assembler = BurstAssembler()
+        self.bursts: list[OpaqueBurst] = self._burst_assembler.completed
 
     @property
     def waiting_for_info(self) -> bool:
@@ -134,7 +133,11 @@ class ScaleSession:
         writes: list[bytes] = []
 
         if decoded.checksum_valid is False:
+            self._burst_assembler.interrupt()
             return SessionOutput(tx_writes=writes, events=[decoded], state=self.state)
+
+        if not isinstance(decoded, MeasurementFrame):
+            self._burst_assembler.interrupt()
 
         if isinstance(decoded, InfoFrame) and self.state is SessionState.WAITING_INFO:
             self.protocol_type = decoded.protocol_type
@@ -174,9 +177,7 @@ class ScaleSession:
             if decoded.b5 == 0x01 and decoded.b6 == 0x21:
                 protocol_type = self.protocol_type or decoded.protocol_type
                 writes.append(build_over_cmd(protocol_type, 0x10, b6=0x21))
-                self._pending_packet1 = decoded
-            elif decoded.b5 == 0x01 and decoded.b6 == 0x22 and self._pending_packet1 is not None:
-                self.bursts.append(reassemble_burst(self._pending_packet1, decoded))
+            self._burst_assembler.add(decoded)
 
         return SessionOutput(tx_writes=writes, events=[decoded], state=self.state)
 
@@ -198,8 +199,7 @@ class ScaleSession:
         self.configured = False
         self.received_events.clear()
         self.measurements.clear()
-        self._pending_packet1 = None
-        self.bursts.clear()
+        self._burst_assembler.reset()
 
 
 __all__ = [

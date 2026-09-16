@@ -1,22 +1,26 @@
-"""MCP 2026-07-28 adapter over Tracky's domain services."""
+"""On-demand, read-only MCP projection over Tracky history."""
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+import base64
+import json
+from datetime import datetime
+from typing import Annotated
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from tracky_mcp import __version__
-from tracky_mcp.acquisition import AcquisitionService, DeviceService
-from tracky_mcp.storage import SQLiteMeasurementStore
+from tracky_mcp.storage import (
+    MeasurementSessionSummary,
+    SessionNotFoundError,
+    SQLiteMeasurementStore,
+)
 
 from .views import (
-    DeviceList,
-    DeviceView,
+    ErrorDetail,
     FramesResource,
-    OperationView,
     SessionList,
     SessionResource,
     SessionSummary,
@@ -28,148 +32,142 @@ _READ_ONLY = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
-_LOCAL_MUTATION = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=False,
-)
-_BLE_ACTION = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=False,
-    openWorldHint=True,
-)
-_CANCEL_ACTION = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=True,
-    idempotentHint=True,
-    openWorldHint=False,
-)
 
 Limit = Annotated[int, Field(ge=1, le=100)]
-ScanTimeout = Annotated[float, Field(gt=0, le=30)]
-AcquisitionTimeout = Annotated[float, Field(gt=0, le=300)]
+SessionId = Annotated[str, Field(min_length=1, max_length=128)]
+Cursor = Annotated[str, Field(min_length=1, max_length=256)]
+_CURSOR_PREFIX = "s1."
+_NO_SESSIONS_MESSAGE = "No captured measurement sessions are available"
+_SESSION_NOT_FOUND_MESSAGE = "Measurement session was not found"
+_INVALID_CURSOR_MESSAGE = "The session cursor is invalid"
 
 
-def create_server(
-    store: SQLiteMeasurementStore,
+def _error_detail(
+    code: str,
+    message: str,
     *,
-    devices: DeviceService | None = None,
-    acquisitions: AcquisitionService | None = None,
-) -> MCPServer:
-    """Build an injectable modern MCP server without owning storage lifetime."""
+    session_id: str | None = None,
+) -> ErrorDetail:
+    return ErrorDetail(code=code, message=message, session_id=session_id)
 
-    device_service = devices or DeviceService(store)
-    acquisition_service = acquisitions or AcquisitionService(store)
+
+def _encode_cursor(session: MeasurementSessionSummary) -> str:
+    payload = {
+        "v": 1,
+        "started_at": session.started_at.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        ),
+        "session_id": session.id,
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return f"{_CURSOR_PREFIX}{encoded.rstrip('=')}"
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, str]:
+    if not cursor.startswith(_CURSOR_PREFIX):
+        raise ValueError("unsupported cursor version")
+    encoded = cursor[len(_CURSOR_PREFIX) :]
+    if not encoded:
+        raise ValueError("empty cursor payload")
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        started_at = datetime.fromisoformat(str(payload["started_at"]).replace("Z", "+00:00"))
+        session_id = str(payload["session_id"])
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("malformed cursor payload") from exc
+    if started_at.tzinfo is None or started_at.utcoffset() is None:
+        raise ValueError("cursor timestamp must be timezone-aware")
+    if not session_id or len(session_id) > 128 or payload.get("v") != 1:
+        raise ValueError("invalid cursor fields")
+    return started_at, session_id
+
+
+def _not_found(session_id: str) -> ErrorDetail:
+    return _error_detail(
+        "session_not_found",
+        _SESSION_NOT_FOUND_MESSAGE,
+        session_id=session_id,
+    )
+
+
+def create_server(store: SQLiteMeasurementStore) -> MCPServer:
+    """Build the read-only MCP projection without acquiring or recovering work.
+
+    Acquisition ownership stays with the Linux daemon. This function only
+    registers history tools and session/frame resources; it never constructs an
+    acquisition service or performs operation recovery.
+    """
+
     server = MCPServer(
         "tracky-mcp",
-        title="Tracky local measurement server",
-        description="Local CS10B BLE acquisition, raw evidence, and measurement history.",
+        title="Tracky read-only measurement history",
+        description="On-demand read-only CS10B session history and wire evidence.",
         instructions=(
-            "Treat raw frames as evidence and decoded values as interpretations. "
-            "A completed acquisition only means recording stopped; selected_frame_sequence "
-            "remains null until a scientifically justified final-sample policy exists. "
-            "Never assign units or segment/frequency labels to resistance_raw without provenance."
+            "Read captured history only. Treat raw frames as evidence and decoded values "
+            "as interpretations. Quality is a separate versioned field, and selected "
+            "weight is present only when the contract supplies it. Keep opaque word blocks "
+            "unassigned to units, channels, frequencies, or physiological meaning."
         ),
         version=__version__,
     )
 
-    @server.tool(annotations=ToolAnnotations(**_BLE_ACTION.model_dump(by_alias=True)))
-    async def discover_devices(timeout_seconds: ScanTimeout = 5.0) -> DeviceList:
-        """Scan locally for supported scales and return opaque device IDs."""
+    @server.tool(annotations=_READ_ONLY)
+    async def list_sessions(limit: Limit = 20, cursor: Cursor | None = None) -> SessionList:
+        """List bounded newest-first summaries using an opaque continuation cursor."""
 
-        discovered = await device_service.discover(timeout=timeout_seconds)
-        return DeviceList(devices=[DeviceView.from_record(device) for device in discovered])
+        after: tuple[datetime, str] | None = None
+        if cursor is not None:
+            try:
+                after = _decode_cursor(cursor)
+            except ValueError:
+                return SessionList(
+                    ok=False,
+                    error=_error_detail("invalid_cursor", _INVALID_CURSOR_MESSAGE),
+                )
 
-    @server.tool(annotations=ToolAnnotations(**_READ_ONLY.model_dump(by_alias=True)))
-    async def list_devices(limit: Limit = 100) -> DeviceList:
-        """List previously discovered scales without exposing BLE addresses."""
-
-        return DeviceList(
-            devices=[
-                DeviceView.from_record(device)
-                for device in device_service.list_known(limit=limit)
-            ]
-        )
-
-    @server.tool(annotations=ToolAnnotations(**_LOCAL_MUTATION.model_dump(by_alias=True)))
-    async def configure_device(
-        device_id: str,
-        alias: str | None = None,
-        model_label: str | None = None,
-    ) -> DeviceView:
-        """Set local labels for an opaque device ID; this does not contact the scale."""
-
-        return DeviceView.from_record(
-            device_service.configure(
-                device_id,
-                alias=alias,
-                model_label=model_label,
-            )
-        )
-
-    @server.tool(annotations=ToolAnnotations(**_BLE_ACTION.model_dump(by_alias=True)))
-    async def start_weigh_in(
-        device_id: str,
-        unit: Literal["kg", "lb"] = "kg",
-        condition: str | None = None,
-        timeout_seconds: AcquisitionTimeout = 60.0,
-    ) -> OperationView:
-        """Start recording a weigh-in and return a durable, pollable operation handle."""
-
-        request = device_service.weigh_in_request(
-            device_id,
-            unit=unit,
-            condition=condition,
-            timeout_seconds=timeout_seconds,
-            metadata={"source": "mcp"},
-        )
-        operation_id = acquisition_service.start(request)
-        return OperationView.from_record(acquisition_service.get(operation_id))
-
-    @server.tool(annotations=ToolAnnotations(**_READ_ONLY.model_dump(by_alias=True)))
-    async def get_operation(operation_id: str) -> OperationView:
-        """Poll a persisted acquisition operation without relying on connection state."""
-
-        return OperationView.from_record(acquisition_service.get(operation_id))
-
-    @server.tool(annotations=ToolAnnotations(**_LOCAL_MUTATION.model_dump(by_alias=True)))
-    async def stop_weigh_in(operation_id: str) -> OperationView:
-        """Stop recording successfully; this does not select or assert a stable frame."""
-
-        return OperationView.from_record(await acquisition_service.stop(operation_id))
-
-    @server.tool(annotations=ToolAnnotations(**_CANCEL_ACTION.model_dump(by_alias=True)))
-    async def cancel_weigh_in(operation_id: str) -> OperationView:
-        """Abort active acquisition while retaining all recorded evidence."""
-
-        return OperationView.from_record(await acquisition_service.cancel(operation_id))
-
-    @server.tool(annotations=ToolAnnotations(**_READ_ONLY.model_dump(by_alias=True)))
-    async def list_sessions(limit: Limit = 20) -> SessionList:
-        """List recent session summaries, newest first, without loading raw frames."""
-
-        sessions = store.list_sessions(limit=limit)
+        sessions = store.list_session_summaries(limit=limit + 1, after=after)
+        has_more = len(sessions) > limit
+        page = sessions[:limit]
+        next_cursor = _encode_cursor(page[-1]) if has_more and page else None
         return SessionList(
-            sessions=[SessionSummary.from_record(session) for session in sessions]
+            sessions=[SessionSummary.from_record(session) for session in page],
+            next_cursor=next_cursor,
         )
 
-    @server.resource(
-        "tracky://devices/{device_id}",
-        mime_type="application/json",
-        description="Agent-safe local scale identity; excludes the BLE connection target.",
-    )
-    async def device_resource(device_id: str) -> str:
-        return DeviceView.from_record(store.get_device(device_id)).model_dump_json()
+    @server.tool(annotations=_READ_ONLY)
+    async def get_latest_session() -> SessionResource:
+        """Return metadata for the newest captured session or a stable empty result."""
 
-    @server.resource(
-        "tracky://operations/{operation_id}",
-        mime_type="application/json",
-        description="Persisted acquisition-operation state.",
-    )
-    async def operation_resource(operation_id: str) -> str:
-        return OperationView.from_record(store.get_operation(operation_id)).model_dump_json()
+        session = store.get_latest_session_summary()
+        if session is None:
+            return SessionResource(
+                ok=False,
+                error=_error_detail("no_sessions", _NO_SESSIONS_MESSAGE),
+            )
+        return SessionResource.from_record(session)
+
+    @server.tool(annotations=_READ_ONLY)
+    async def get_session(session_id: SessionId) -> SessionResource:
+        """Return one session's metadata or a stable not-found result."""
+
+        try:
+            session = store.get_session_summary(session_id)
+        except SessionNotFoundError:
+            return SessionResource(ok=False, error=_not_found(session_id))
+        return SessionResource.from_record(session)
+
+    @server.tool(annotations=_READ_ONLY)
+    async def get_session_evidence(session_id: SessionId) -> FramesResource:
+        """Return one session's complete ordered wire evidence or a stable error."""
+
+        try:
+            session = store.get_session(session_id)
+        except SessionNotFoundError:
+            return FramesResource(ok=False, error=_not_found(session_id))
+        return FramesResource.from_record(session)
 
     @server.resource(
         "tracky://sessions/{session_id}",
@@ -177,7 +175,11 @@ def create_server(
         description="Measurement-session metadata and evidence counts, excluding frame bodies.",
     )
     async def session_resource(session_id: str) -> str:
-        return SessionResource.from_record(store.get_session(session_id)).model_dump_json()
+        try:
+            session = store.get_session_summary(session_id)
+        except SessionNotFoundError:
+            return SessionResource(ok=False, error=_not_found(session_id)).model_dump_json()
+        return SessionResource.from_record(session).model_dump_json()
 
     @server.resource(
         "tracky://sessions/{session_id}/frames",
@@ -185,7 +187,11 @@ def create_server(
         description="Complete ordered RX/TX evidence stream for a measurement session.",
     )
     async def frames_resource(session_id: str) -> str:
-        return FramesResource.from_record(store.get_session(session_id)).model_dump_json()
+        try:
+            session = store.get_session(session_id)
+        except SessionNotFoundError:
+            return FramesResource(ok=False, error=_not_found(session_id)).model_dump_json()
+        return FramesResource.from_record(session).model_dump_json()
 
     return server
 

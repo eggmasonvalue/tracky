@@ -28,8 +28,10 @@
 
 ## Verification
 
-- Run Linux tests with `cd linux && pytest`.
-- Run Linux lint with `cd linux && ruff check src tests`.
+- Use the UV-managed Python pinned by `linux/.python-version`; do not use the system Python.
+- Install Linux environments with `cd linux && uv sync --extra dev --extra ble --extra mcp`.
+- Run Linux tests with `cd linux && uv run pytest`.
+- Run Linux lint with `cd linux && uv run ruff check src tests`.
 - Run Android checks with `cd android && ./gradlew testDebugUnitTest lintDebug assembleDebug`.
 - Run documentation lint with `npx --yes markdownlint-cli2 "README.md" "AGENTS.md" "context/*.md" "contracts/*.md" "skills/**/*.md" "linux/fixtures/**/*.md"`.
 - Update the affected contract and fixture tests with every boundary change.

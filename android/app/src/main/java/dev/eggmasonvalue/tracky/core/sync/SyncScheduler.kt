@@ -1,6 +1,7 @@
 package dev.eggmasonvalue.tracky.core.sync
 
 import android.content.Context
+import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
@@ -11,39 +12,36 @@ import androidx.work.WorkManager
 import java.util.concurrent.TimeUnit
 
 object SyncScheduler {
-
-    private const val PERIODIC_WORK_NAME = "tracky_background_sync"
-    private const val IMMEDIATE_WORK_NAME = "tracky_immediate_sync"
+    private const val PERIODIC_WORK_NAME = "tracky_observation_sync_periodic_trigger"
+    private const val IMMEDIATE_WORK_NAME = "tracky_observation_sync"
 
     fun schedulePeriodicSync(context: Context) {
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
-            .build()
-
-        val periodicWork = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES)
-            .setConstraints(constraints)
-            .build()
-
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             PERIODIC_WORK_NAME,
             ExistingPeriodicWorkPolicy.KEEP,
-            periodicWork,
+            periodicRequest(),
         )
     }
 
     fun triggerImmediateSync(context: Context) {
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
-            .build()
-
-        val immediateWork = OneTimeWorkRequestBuilder<SyncWorker>()
-            .setConstraints(constraints)
-            .build()
-
         WorkManager.getInstance(context).enqueueUniqueWork(
             IMMEDIATE_WORK_NAME,
-            ExistingWorkPolicy.REPLACE,
-            immediateWork,
+            ExistingWorkPolicy.KEEP,
+            oneTimeRequest(),
         )
     }
+
+    private fun constraints() = Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .build()
+
+    private fun periodicRequest() = PeriodicWorkRequestBuilder<SyncKickoffWorker>(15, TimeUnit.MINUTES)
+        .setConstraints(constraints())
+        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+        .build()
+
+    private fun oneTimeRequest() = OneTimeWorkRequestBuilder<SyncWorker>()
+        .setConstraints(constraints())
+        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+        .build()
 }

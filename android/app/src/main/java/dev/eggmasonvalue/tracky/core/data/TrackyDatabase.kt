@@ -7,8 +7,8 @@ import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
 
 @Database(
-    entities = [SessionEntity::class, RawFrameEntity::class],
-    version = 1,
+    entities = [ImportLedgerEntity::class, SyncStateEntity::class],
+    version = 2,
     exportSchema = true,
 )
 @TypeConverters(TrackyTypeConverters::class)
@@ -16,7 +16,7 @@ abstract class TrackyDatabase : RoomDatabase() {
     internal abstract fun trackyDao(): TrackyDao
 
     companion object {
-        const val DATABASE_NAME: String = "tracky.db"
+        const val DATABASE_NAME: String = "tracky-import-ledger.db"
 
         fun build(context: Context): TrackyDatabase =
             Room.databaseBuilder(

@@ -1,5 +1,13 @@
 """CS10B framing, decoding, and pure session state (no BLE transport)."""
 
+from .burst import (
+    PACKET_ONE_MARKER,
+    PACKET_TWO_MARKER,
+    WORD_BLOCK_LENGTH,
+    BurstAssembler,
+    OpaqueBurst,
+    reassemble_burst,
+)
 from .checksum import append_checksum, checksum, has_valid_checksum
 from .decode import (
     DECODER_ID,
@@ -10,11 +18,9 @@ from .decode import (
     FrameInput,
     InfoFrame,
     MeasurementFrame,
-    SegmentalBioimpedance,
     StatusFrame,
     UnknownFrame,
     decode_frame,
-    reassemble_burst,
 )
 from .frames import (
     CHECKSUM_BEARING_OPCODES,
@@ -31,10 +37,19 @@ from .frames import (
     qn_epoch_from_datetime,
     qn_epoch_from_unix,
 )
+from .quality import (
+    QUALITY_VERSION,
+    WEIGHT_SELECTION_POLICY_VERSION,
+    AcquisitionCompletionPolicy,
+    CompletionDecision,
+    CompletionPolicy,
+    MeasurementQuality,
+)
 from .session import ScaleSession, SessionOutput, SessionState
 
 __all__ = [
     "CHECKSUM_BEARING_OPCODES",
+    "BurstAssembler",
     "CommandFrame",
     "DECODER_ID",
     "DECODER_VERSION",
@@ -45,13 +60,22 @@ __all__ = [
     "MeasurementFrame",
     "Opcode",
     "QN_EPOCH_UNIX",
+    "OpaqueBurst",
+    "PACKET_ONE_MARKER",
+    "PACKET_TWO_MARKER",
+    "QUALITY_VERSION",
+    "WEIGHT_SELECTION_POLICY_VERSION",
+    "AcquisitionCompletionPolicy",
+    "CompletionDecision",
+    "CompletionPolicy",
+    "MeasurementQuality",
     "ScaleSession",
-    "SegmentalBioimpedance",
     "SessionOutput",
     "SessionState",
     "StatusFrame",
     "UnknownFrame",
     "WeightUnit",
+    "WORD_BLOCK_LENGTH",
     "append_checksum",
     "build_a0_1",
     "build_a0_2",

@@ -25,7 +25,7 @@ handshake writes. This successful run used the following observed sequence:
 6. FFF1 0x21 response.
 7. Two FFF2 0xA0 writes.
 8. Repeated FFF1 0x10 live frames, first weight-only and later with a
-   resistance-bearing block.
+   word-block block.
 
 Only FFF1 notifications were enabled in this run. AE02 was discovered but was
 not used. No runtime Feelfit, Yolanda SDK, or vendor cloud dependency is
@@ -40,11 +40,11 @@ implied by this capture.
 - `b5=0x00` occurs on the weight-only path; `b5=0x01` occurs when the raw
   five-value block is present. `b6=0x11` and `b6=0x21` also differ between
   those paths. Their exact status/stability meanings remain open.
-- `resistance_raw[]` is five consecutive big-endian u16 candidates at bytes
+- `opaque_words[]` is five consecutive big-endian u16 candidates at bytes
   7–16. Examples include `[3386, 2950, 3516, 3050, 3392]`. Field boundaries
-  and repetition are strong evidence; ohms, frequency, segment mapping, and
+  and repetition are strong evidence; units, frequency, ordering mapping, and
   body-composition interpretation are not established. Do not label these
-  values as ohms yet.
+  values with electrical units yet.
 
 ## Checksum verification
 
@@ -73,7 +73,7 @@ the authoritative raw-packet source for this fixture.
   metadata for the connected FFF0 service?
 - What are the exact meanings of 0x12, 0x14, 0x21, the two 0xA0 writes, and
   `b5`/`b6`?
-- Are the five raw values impedance/resistance measurements, and if so what
+- Are the five raw values electrical measurements, and if so what
   units, frequencies, and segment order do they use?
 - Which writes are required for a minimal production handshake, and is AE02
   ever needed?

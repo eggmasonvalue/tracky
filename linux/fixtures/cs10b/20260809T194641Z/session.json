@@ -173,16 +173,16 @@
   "decode_hypotheses": {
     "weight_formula": "int.from_bytes(frame[3:5], 'big') / 100",
     "weight_only_count": 0,
-    "resistance_block_count": 33,
-    "resistance_all_zero_count": 33,
-    "resistance_nonzero_count": 0,
-    "resistance_0x10_examples": [
+    "opaque_word_block_count": 33,
+    "opaque_words_all_zero_count": 33,
+    "opaque_words_nonzero_count": 0,
+    "opaque_word_block_0x10_examples": [
       {
         "frame_hex": "1012201ed201210000000000000000000054",
         "weight_kg": 78.9,
         "b5": 1,
         "b6": 33,
-        "resistance_raw": [
+        "opaque_words": [
           0,
           0,
           0,
@@ -195,7 +195,7 @@
   "summary": {
     "measurement_count": 33,
     "stable_weight_kg": 78.9,
-    "last_resistance_raw": [
+    "last_opaque_words": [
       0,
       0,
       0,

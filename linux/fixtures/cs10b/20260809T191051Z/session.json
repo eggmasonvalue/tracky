@@ -180,7 +180,7 @@
     },
     {
       "step": 8,
-      "description": "FFF1 notify: repeated 0x10 live frames, weight-only then resistance-bearing frames.",
+      "description": "FFF1 notify: repeated 0x10 live frames, weight-only then word-block frames.",
       "event_ids": [
         "e022",
         "e023",
@@ -263,9 +263,9 @@
         "formula_candidate": "sum(frame[:-1]) & 0xff",
         "matches": true
       },
-      "resistance_raw": []
+      "opaque_words": []
     },
-    "resistance_0x10_examples": [
+    "opaque_word_block_0x10_examples": [
       {
         "opcode": "0x10",
         "frame_hex": "1012201edc01210d770bba0df90c140d5e38",
@@ -283,16 +283,16 @@
           "formula_candidate": "sum(frame[:-1]) & 0xff",
           "matches": true
         },
-        "resistance_raw": [
+        "opaque_words": [
           3447,
           3002,
           3577,
           3092,
           3422
         ],
-        "resistance_layout_candidate": "five consecutive big-endian u16 values at bytes 7..16",
-        "resistance_unit": null,
-        "resistance_confidence": "low: field boundary and repetition are clear; ohms/frequency/segment meaning is unproven"
+        "word_layout_candidate": "five consecutive big-endian u16 values at bytes 7..16",
+        "word_unit": null,
+        "word_confidence": "low: field boundary and repetition are clear; units/frequency/ordering meaning is unproven"
       }
     ]
   },

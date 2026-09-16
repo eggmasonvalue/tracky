@@ -73,23 +73,18 @@ class TrackyDaemon:
                 detection_callback=self._on_detection,
                 adapter=self.adapter,
             )
-        try:
-            from bleak import BleakScanner
+        from bleak import BleakScanner
 
-            kwargs: dict[str, Any] = {
-                "detection_callback": self._on_detection,
-                "scanning_mode": "passive",
-            }
-            if self.adapter:
-                kwargs["adapter"] = self.adapter
-            return BleakScanner(**kwargs)
-        except (ImportError, TypeError):
-            from bleak import BleakScanner
-
-            kwargs = {"detection_callback": self._on_detection}
-            if self.adapter:
-                kwargs["adapter"] = self.adapter
-            return BleakScanner(**kwargs)
+        # BlueZ passive discovery requires kernel ``or_patterns`` support that
+        # is absent on common adapters.  Active discovery is the tested
+        # configuration and still lets the callback filter by name/service.
+        kwargs: dict[str, Any] = {
+            "detection_callback": self._on_detection,
+            "scanning_mode": "active",
+        }
+        if self.adapter:
+            kwargs["adapter"] = self.adapter
+        return BleakScanner(**kwargs)
 
     def _on_detection(self, device: Any, advertisement_data: Any) -> None:
         """Invoked synchronously by bleak when an advertisement is received."""
@@ -113,7 +108,7 @@ class TrackyDaemon:
     ) -> None:
         async with self._lock:
             if self._active_operation_id is not None:
-                logger.debug("Scale %s seen but acquisition already active; ignoring", address)
+                logger.debug("Scale seen but acquisition already active; ignoring")
                 return
 
             now = datetime.now(timezone.utc)
@@ -121,13 +116,12 @@ class TrackyDaemon:
                 elapsed = (now - self._last_completed_at).total_seconds()
                 if elapsed < self.cooldown_seconds:
                     logger.debug(
-                        "Scale %s seen during cooldown (%0.1fs); ignoring",
-                        address,
+                        "Scale seen during cooldown (%0.1fs); ignoring",
                         elapsed,
                     )
                     return
 
-            logger.info("Scale detected: %s (%s). Starting acquisition.", name, address)
+            logger.info("Scale detected: %s. Starting acquisition.", name)
 
             # Register/update device in store
             service_uuids = _field(advertisement_data, "service_uuids") or []
@@ -152,7 +146,7 @@ class TrackyDaemon:
                 self._active_operation_id = operation_id
                 self._active_task = asyncio.current_task()
             except Exception as exc:
-                logger.exception("Failed to start acquisition for %s: %s", address, exc)
+                logger.exception("Failed to start scale acquisition: %s", exc)
                 return
 
         # Await completion outside the lock so other detection callbacks can check active state

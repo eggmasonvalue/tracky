@@ -1,7 +1,8 @@
 """Persisted, explicit-handle acquisition orchestration.
 
-The service bridges an injected BLE event source to storage without deciding
-which repeated measurement is "stable". MCP can project these operations later;
+The service bridges an injected BLE event source to storage and delegates
+completion/quality decisions to the versioned protocol policy. MCP can project
+these operations later;
 this module has no MCP dependency and never treats a connection as state.
 """
 
@@ -14,7 +15,12 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from tracky_mcp.ble import ScaleClient, WireEvent, WireObserver
-from tracky_mcp.protocol import DecodedFrame
+from tracky_mcp.protocol import (
+    AcquisitionCompletionPolicy,
+    CompletionDecision,
+    DecodedFrame,
+    MeasurementQuality,
+)
 from tracky_mcp.storage import (
     AcquisitionOperation,
     MeasurementSession,
@@ -48,11 +54,17 @@ class WeighInRequest:
     address_hash: str | None = None
     condition: str | None = None
     timeout_seconds: float = 60.0
+    completion_idle_seconds: float = 3.0
+    stable_measurements: int = 3
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero")
+        if self.completion_idle_seconds <= 0:
+            raise ValueError("completion_idle_seconds must be greater than zero")
+        if self.stable_measurements < 2:
+            raise ValueError("stable_measurements must be at least 2")
 
 
 ClientFactory = Callable[[WeighInRequest, WireObserver], AcquisitionClient]
@@ -66,9 +78,9 @@ class AcquisitionService:
     """Run and persist weigh-ins behind opaque, pollable operation handles.
 
     ``start`` returns immediately. The caller may poll ``get``, explicitly
-    ``stop`` a successful observation window, or ``cancel`` it. Peripheral
-    disconnect also completes a session. A safety timeout fails and aborts the
-    session while preserving every frame received so far.
+    ``stop`` a successful observation window, or ``cancel`` it. A stream end or
+    evidence-backed idle window completes a session. The safety timeout is a
+    last-resort failure while preserving every frame received so far.
     """
 
     def __init__(
@@ -203,6 +215,11 @@ class AcquisitionService:
                 started_at=started_at,
             )
 
+            policy = AcquisitionCompletionPolicy(
+                stable_measurements=request.stable_measurements,
+                idle_seconds=request.completion_idle_seconds,
+            )
+
             def record_wire(event: WireEvent) -> None:
                 elapsed = max(
                     0,
@@ -216,17 +233,33 @@ class AcquisitionService:
                     direction=event.direction,
                     characteristic_uuid=event.characteristic_uuid,
                 )
+                # Quality may rely on a TX ACK, but only after that exact wire
+                # event has been durably appended to the canonical store.
+                policy.observe_wire(event.direction, event.data)
 
             client = self._client_factory(request, record_wire)
             async with asyncio.timeout(request.timeout_seconds):
-                await self._consume_until_stopped(client, stop_event)
+                decision = await self._consume_until_stopped(client, stop_event, policy)
 
             finished_at = self._now()
+            selected_frame_sequence = self._selected_frame_sequence(
+                session_id,
+                decision,
+            )
             self.store.finish_acquisition(
                 operation_id,
                 session_id=session_id,
                 status=OperationStatus.COMPLETE,
                 finished_at=finished_at,
+                quality=decision.quality,
+                quality_reason=decision.reason,
+                completion_reason=decision.reason,
+                selected_frame_sequence=selected_frame_sequence,
+                selection_policy_version=(
+                    decision.selection_policy_version
+                    if selected_frame_sequence is not None
+                    else None
+                ),
             )
         except asyncio.CancelledError:
             await self._close_failed_session(session_id, operation_id, cancelled=True)
@@ -254,42 +287,71 @@ class AcquisitionService:
                     # The primary persisted outcome wins over a teardown race.
                     pass
 
+    def _selected_frame_sequence(
+        self,
+        session_id: str,
+        decision: CompletionDecision,
+    ) -> int | None:
+        """Resolve the policy's exact selected wire frame after durable capture."""
+
+        if decision.selected_frame_raw is None:
+            return None
+        session = self.store.get_session(session_id)
+        for frame in reversed(session.frames):
+            if (
+                frame.raw == decision.selected_frame_raw
+                and frame.measurement is not None
+                and frame.checksum_valid is True
+            ):
+                return frame.sequence
+        # A selection that cannot be tied back to durable evidence is unsafe to
+        # project; leave the immutable session unselected rather than guessing.
+        return None
+
     async def _consume_until_stopped(
         self,
         client: AcquisitionClient,
         stop_event: asyncio.Event,
-    ) -> None:
+        policy: AcquisitionCompletionPolicy,
+    ) -> CompletionDecision:
         iterator = client.events().__aiter__()
         next_event: asyncio.Task[DecodedFrame] | None = None
         stopped: asyncio.Task[bool] | None = None
+        idle: asyncio.Task[None] | None = None
         try:
             while True:
                 next_event = asyncio.create_task(anext(iterator))
                 stopped = asyncio.create_task(stop_event.wait())
+                wait_for: set[asyncio.Task[Any]] = {next_event, stopped}
+                if policy.can_finish_after_idle:
+                    idle = asyncio.create_task(asyncio.sleep(policy.idle_seconds))
+                    wait_for.add(idle)
                 done, pending = await asyncio.wait(
-                    {next_event, stopped},
+                    wait_for,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
+
+                # Prefer an event delivered concurrently with stop/idle so a
+                # packet-2 response is not mistaken for an idle boundary.
+                if next_event in done:
+                    try:
+                        event = next_event.result()
+                    except StopAsyncIteration:
+                        return policy.finish("stream_closed")
+                    policy.observe(event)
+                    next_event = None
+                    stopped = None
+                    idle = None
+                    continue
                 if stopped in done and stopped.result():
-                    if next_event in done:
-                        # Consume a simultaneously delivered event; its wire
-                        # callback has already persisted the bytes.
-                        try:
-                            next_event.result()
-                        except StopAsyncIteration:
-                            pass
-                    return
-                try:
-                    next_event.result()
-                except StopAsyncIteration:
-                    return
-                next_event = None
-                stopped = None
+                    return policy.finish("explicit_stop")
+                if idle is not None and idle in done:
+                    return policy.finish("measurement_idle")
         finally:
-            active = [task for task in (next_event, stopped) if task is not None]
+            active = [task for task in (next_event, stopped, idle) if task is not None]
             for task in active:
                 if not task.done():
                     task.cancel()
@@ -321,12 +383,21 @@ class AcquisitionService:
                 finished_at=finished_at,
                 error_code="cancelled" if cancelled else error_code,
                 error_message=error_message,
+                quality=MeasurementQuality.INDETERMINATE,
+                quality_reason=error_code,
+                completion_reason=error_code,
             )
             return
         if session_id is not None:
             session = self.store.get_session(session_id)
             if session.status is SessionStatus.OPEN:
-                self.store.abort_session(session_id, ended_at=finished_at)
+                self.store.abort_session(
+                    session_id,
+                    ended_at=finished_at,
+                    quality=MeasurementQuality.INDETERMINATE,
+                    quality_reason=error_code,
+                    completion_reason=error_code,
+                )
         if cancelled:
             self.store.cancel_operation(
                 operation_id,

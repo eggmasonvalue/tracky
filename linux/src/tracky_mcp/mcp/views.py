@@ -1,4 +1,4 @@
-"""Structured, agent-safe MCP views over Tracky's domain records."""
+"""Structured, agent-safe MCP views over Tracky's canonical records."""
 
 from __future__ import annotations
 
@@ -7,12 +7,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from tracky_mcp.protocol import BurstAssembler, MeasurementFrame, decode_frame
 from tracky_mcp.storage import (
     AcquisitionOperation,
     KnownDevice,
     MeasurementSession,
+    MeasurementSessionSummary,
     StoredFrame,
 )
+
+CONTRACT_VERSION = 1
+TRANSPORT_VERSION = 1
+SELECTION_POLICY_VERSION = 1
 
 
 class DeviceView(BaseModel):
@@ -84,6 +90,55 @@ class OperationView(BaseModel):
         )
 
 
+class ContractVersions(BaseModel):
+    """Version identifiers that qualify one observation projection."""
+
+    transport_version: int = TRANSPORT_VERSION
+    decoder_version: int | None
+    decoder_versions: list[int]
+    selection_policy_version: int = SELECTION_POLICY_VERSION
+    quality_version: int
+
+
+class ErrorDetail(BaseModel):
+    """Stable, machine-readable outcome detail for a read failure."""
+
+    code: Literal["no_sessions", "session_not_found", "invalid_cursor"]
+    message: str
+    session_id: str | None = None
+
+
+class WeightEvidence(BaseModel):
+    """Source weight fields without consumer-side conversion."""
+
+    raw: int
+    divisor: int
+    unit: str
+    provenance: str
+
+
+class FrameReference(BaseModel):
+    """A stable reference to one frame in the canonical evidence resource."""
+
+    session_id: str
+    sequence: int
+    resource_uri: str
+
+
+class RawFramesReference(BaseModel):
+    """O(1) metadata reference to a session's ordered frame resource."""
+
+    resource_uri: str
+    count: int
+
+
+class SelectedEvidence(BaseModel):
+    """Optional source-weight selection explicitly recorded by Linux."""
+
+    frame_sequence: int
+    weight: WeightEvidence | None
+
+
 class MeasurementView(BaseModel):
     protocol_type: int
     weight_raw_u16_be: int
@@ -92,12 +147,43 @@ class MeasurementView(BaseModel):
     weight_kg: str = Field(description="Exact decimal derived from raw/divisor")
     weight_formula: str
     weight_provenance: str
+    weight: WeightEvidence
     b5: int
     b6: int
-    resistance_raw: list[int]
-    resistance_layout: str | None
-    resistance_unit: str | None
-    resistance_provenance: str
+    opaque_words: list[int]
+    word_layout: str | None
+    word_provenance: str
+    opaque_unit_evidence: str | None
+
+
+_LEGACY_FIELD_RENAMES = {
+    "resistance_raw": "opaque_words",
+    "resistance_layout": "word_layout",
+    "resistance_unit": "opaque_unit_evidence",
+    "resistance_provenance": "word_provenance",
+}
+_FORBIDDEN_LEGACY_FIELD_PARTS = ("resistance", "impedance", "ohm")
+
+
+def _consumer_decoded_fields(frame: StoredFrame) -> dict[str, Any]:
+    """Project legacy decoded fields without exporting semantic labels.
+
+    Storage keeps the original JSON unchanged for forensic compatibility. The
+    MCP projection may rename known legacy keys to opaque evidence names and
+    omits unknown electrical labels rather than presenting them as facts.
+    """
+
+    projected: dict[str, Any] = {}
+    for key, value in frame.decoded_fields.items():
+        normalized = key.casefold()
+        renamed = _LEGACY_FIELD_RENAMES.get(normalized)
+        if renamed is not None:
+            projected.setdefault(renamed, value)
+            continue
+        if any(part in normalized for part in _FORBIDDEN_LEGACY_FIELD_PARTS):
+            continue
+        projected[key] = value
+    return projected
 
 
 class FrameView(BaseModel):
@@ -121,6 +207,7 @@ class FrameView(BaseModel):
         measurement = frame.measurement
         measurement_view = None
         if measurement is not None:
+            words = list(measurement.word_block)
             measurement_view = MeasurementView(
                 protocol_type=measurement.protocol_type,
                 weight_raw_u16_be=measurement.weight_raw_u16_be,
@@ -129,12 +216,18 @@ class FrameView(BaseModel):
                 weight_kg=format(measurement.weight_kg, "f"),
                 weight_formula=measurement.weight_formula,
                 weight_provenance=measurement.weight_provenance,
+                weight=WeightEvidence(
+                    raw=measurement.weight_raw_u16_be,
+                    divisor=measurement.weight_scale_divisor,
+                    unit=measurement.weight_unit,
+                    provenance=measurement.weight_provenance,
+                ),
                 b5=measurement.b5,
                 b6=measurement.b6,
-                resistance_raw=list(measurement.resistance_raw),
-                resistance_layout=measurement.resistance_layout,
-                resistance_unit=measurement.resistance_unit,
-                resistance_provenance=measurement.resistance_provenance,
+                opaque_words=words,
+                word_layout=measurement.word_layout,
+                word_provenance=measurement.word_provenance,
+                opaque_unit_evidence=measurement.opaque_unit_evidence,
             )
         return cls(
             sequence=frame.sequence,
@@ -148,14 +241,95 @@ class FrameView(BaseModel):
             checksum_valid=frame.checksum_valid,
             decoder_id=frame.decoder_id,
             decoder_version=frame.decoder_version,
-            decoded_fields=frame.decoded_fields,
+            decoded_fields=_consumer_decoded_fields(frame),
             decode_error=frame.decode_error,
             measurement=measurement_view,
         )
 
 
+SessionRecord = MeasurementSession | MeasurementSessionSummary
+
+
+def _frame_count(session: SessionRecord) -> int:
+    count = getattr(session, "frame_count", None)
+    return len(session.frames) if count is None else count
+
+
+def _measurement_frame_count(session: SessionRecord) -> int:
+    count = getattr(session, "measurement_frame_count", None)
+    return len(session.measurements) if count is None else count
+
+
+def _decoder_versions(session: SessionRecord) -> tuple[int, ...]:
+    stored = getattr(session, "decoder_versions", None)
+    if stored is not None:
+        return tuple(stored)
+    return tuple(sorted({frame.decoder_version for frame in session.frames}))
+
+
+def _frame_references(session_id: str, count: int) -> list[FrameReference]:
+    resource_uri = f"tracky://sessions/{session_id}/frames"
+    return [
+        FrameReference(session_id=session_id, sequence=sequence, resource_uri=resource_uri)
+        for sequence in range(count)
+    ]
+
+
+def _opaque_blocks(session: MeasurementSession) -> tuple[list[int] | None, list[int] | None]:
+    """Return only the latest pair assembled by the wire-valid burst rules."""
+
+    assembler = BurstAssembler()
+    for stored_frame in session.frames:
+        if stored_frame.direction != "rx":
+            continue
+        try:
+            decoded = decode_frame(stored_frame.raw)
+        except ValueError:
+            assembler.interrupt()
+            continue
+        if isinstance(decoded, MeasurementFrame):
+            assembler.add(decoded)
+        else:
+            assembler.interrupt()
+
+    if not assembler.completed:
+        return None, None
+    burst = assembler.completed[-1]
+    return list(burst.block_a), list(burst.block_b)
+
+
+def _selected_evidence(session: SessionRecord) -> SelectedEvidence | None:
+    if isinstance(session, MeasurementSessionSummary):
+        if session.selected_frame_sequence is None:
+            return None
+        return SelectedEvidence(
+            frame_sequence=session.selected_frame_sequence,
+            weight=None,
+        )
+    frame = session.selected_frame
+    if frame is None:
+        return None
+    measurement = frame.measurement
+    if measurement is None:
+        return SelectedEvidence(
+            frame_sequence=frame.sequence,
+            weight=None,
+        )
+    return SelectedEvidence(
+        frame_sequence=frame.sequence,
+        weight=WeightEvidence(
+            raw=measurement.weight_raw_u16_be,
+            divisor=measurement.weight_scale_divisor,
+            unit=measurement.weight_unit,
+            provenance=measurement.weight_provenance,
+        ),
+    )
+
+
 class SessionSummary(BaseModel):
+    contract_version: int = CONTRACT_VERSION
     id: str
+    session_id: str
     status: Literal["open", "complete", "aborted"]
     started_at: datetime
     ended_at: datetime | None
@@ -168,18 +342,31 @@ class SessionSummary(BaseModel):
     requested_unit: str | None
     condition: str | None
     capture_id: str | None
+    quality: Literal["accepted", "contact_failed", "indeterminate"]
+    quality_version: int
+    quality_reason: str | None
+    completion_reason: str | None
     selected_frame_sequence: int | None = Field(
         description="Null unless a separately justified final-sample policy selected a frame"
     )
     frame_count: int
     measurement_frame_count: int
+    raw_frames: RawFramesReference
+    versions: ContractVersions
     resource_uri: str
     frames_resource_uri: str
 
     @classmethod
-    def from_record(cls, session: MeasurementSession) -> SessionSummary:
+    def from_record(cls, session: SessionRecord) -> SessionSummary:
+        decoder_versions = list(_decoder_versions(session))
+        versions = ContractVersions(
+            decoder_version=(decoder_versions[0] if len(decoder_versions) == 1 else None),
+            decoder_versions=decoder_versions,
+            quality_version=session.quality_version,
+        )
         return cls(
             id=session.id,
+            session_id=session.id,
             status=session.status.value,
             started_at=session.started_at,
             ended_at=session.ended_at,
@@ -192,53 +379,123 @@ class SessionSummary(BaseModel):
             requested_unit=session.requested_unit,
             condition=session.condition,
             capture_id=session.capture_id,
+            quality=session.quality.value,
+            quality_version=session.quality_version,
+            quality_reason=session.quality_reason,
+            completion_reason=session.completion_reason,
             selected_frame_sequence=session.selected_frame_sequence,
-            frame_count=len(session.frames),
-            measurement_frame_count=len(session.measurements),
+            frame_count=_frame_count(session),
+            measurement_frame_count=_measurement_frame_count(session),
+            raw_frames=RawFramesReference(
+                resource_uri=f"tracky://sessions/{session.id}/frames",
+                count=_frame_count(session),
+            ),
+            versions=versions,
             resource_uri=f"tracky://sessions/{session.id}",
             frames_resource_uri=f"tracky://sessions/{session.id}/frames",
         )
 
 
 class SessionList(BaseModel):
-    sessions: list[SessionSummary]
+    ok: bool = True
+    contract_version: int = CONTRACT_VERSION
+    sessions: list[SessionSummary] = Field(default_factory=list)
+    next_cursor: str | None = None
+    error: ErrorDetail | None = None
 
 
 class SessionResource(BaseModel):
-    summary: SessionSummary
-    metadata: dict[str, Any]
+    ok: bool = True
+    contract_version: int = CONTRACT_VERSION
+    session_id: str | None = None
+    summary: SessionSummary | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    raw_frames: RawFramesReference | None = None
+    selected: SelectedEvidence | None = None
+    versions: ContractVersions | None = None
+    quality: Literal["accepted", "contact_failed", "indeterminate"] | None = None
+    quality_version: int | None = None
+    opaque_block_a: list[int] | None = None
+    opaque_block_b: list[int] | None = None
+    error: ErrorDetail | None = None
 
     @classmethod
-    def from_record(cls, session: MeasurementSession) -> SessionResource:
-        return cls(summary=SessionSummary.from_record(session), metadata=session.metadata)
+    def from_record(cls, session: SessionRecord) -> SessionResource:
+        summary = SessionSummary.from_record(session)
+        if isinstance(session, MeasurementSession):
+            block_a, block_b = _opaque_blocks(session)
+        else:
+            block_a = block_b = None
+        selected = _selected_evidence(session)
+        return cls(
+            session_id=session.id,
+            summary=summary,
+            metadata=session.metadata,
+            raw_frames=RawFramesReference(
+                resource_uri=f"tracky://sessions/{session.id}/frames",
+                count=summary.frame_count,
+            ),
+            selected=selected,
+            versions=summary.versions,
+            quality=summary.quality,
+            quality_version=summary.quality_version,
+            opaque_block_a=block_a,
+            opaque_block_b=block_b,
+        )
 
 
 class FramesResource(BaseModel):
-    session_id: str
-    selected_frame_sequence: int | None
+    ok: bool = True
+    contract_version: int = CONTRACT_VERSION
+    session_id: str | None = None
+    selected_frame_sequence: int | None = None
+    raw_frames: list[FrameReference] = Field(default_factory=list)
+    selected: SelectedEvidence | None = None
+    versions: ContractVersions | None = None
+    quality: Literal["accepted", "contact_failed", "indeterminate"] | None = None
+    quality_version: int | None = None
+    opaque_block_a: list[int] | None = None
+    opaque_block_b: list[int] | None = None
     interpretation_warning: str = (
-        "Frames are an ordered evidence stream; list order and repetition do not establish "
-        "a stable or final product measurement."
+        "Frames are an ordered wire-evidence stream; word blocks remain opaque and "
+        "quality is separate from checksum validity."
     )
-    frames: list[FrameView]
+    frames: list[FrameView] = Field(default_factory=list)
+    error: ErrorDetail | None = None
 
     @classmethod
     def from_record(cls, session: MeasurementSession) -> FramesResource:
+        summary = SessionSummary.from_record(session)
+        block_a, block_b = _opaque_blocks(session)
         return cls(
             session_id=session.id,
             selected_frame_sequence=session.selected_frame_sequence,
+            raw_frames=_frame_references(session.id, len(session.frames)),
+            selected=_selected_evidence(session),
+            versions=summary.versions,
+            quality=summary.quality,
+            quality_version=summary.quality_version,
+            opaque_block_a=block_a,
+            opaque_block_b=block_b,
             frames=[FrameView.from_record(frame) for frame in session.frames],
         )
 
 
 __all__ = [
+    "CONTRACT_VERSION",
+    "ContractVersions",
     "DeviceList",
+    "ErrorDetail",
     "DeviceView",
+    "FrameReference",
     "FrameView",
     "FramesResource",
     "MeasurementView",
     "OperationView",
+    "RawFramesReference",
+    "SelectedEvidence",
     "SessionList",
     "SessionResource",
     "SessionSummary",
+    "WeightEvidence",
 ]

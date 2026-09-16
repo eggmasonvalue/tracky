@@ -1,10 +1,13 @@
 """Local, lossless, single-user measurement storage."""
 
+from tracky_mcp.protocol import MeasurementQuality
+
 from .models import (
     AcquisitionOperation,
     DeviceConnection,
     KnownDevice,
     MeasurementSession,
+    MeasurementSessionSummary,
     OperationStatus,
     SessionStatus,
     StoredFrame,
@@ -32,7 +35,9 @@ __all__ = [
     "DeviceConnection",
     "DeviceNotFoundError",
     "KnownDevice",
+    "MeasurementQuality",
     "MeasurementSession",
+    "MeasurementSessionSummary",
     "OperationClosedError",
     "OperationNotFoundError",
     "OperationStatus",

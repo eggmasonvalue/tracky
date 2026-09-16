@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
+
+import pytest
 
 from tracky_mcp.daemon import TrackyDaemon
 from tracky_mcp.storage import SQLiteMeasurementStore
@@ -51,6 +54,32 @@ class FakeClient:
 
     async def disconnect(self) -> None:
         self.disconnected = True
+
+
+def test_daemon_uses_active_bleak_discovery_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class ConfiguredScanner:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    bleak = ModuleType("bleak")
+    bleak.BleakScanner = ConfiguredScanner  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "bleak", bleak)
+
+    store = SQLiteMeasurementStore(path=tmp_path / "test.db")
+    try:
+        daemon = TrackyDaemon(store=store, adapter="hci0")
+        daemon._create_scanner()
+    finally:
+        store.close()
+
+    assert captured["scanning_mode"] == "active"
+    assert captured["adapter"] == "hci0"
+    assert callable(captured["detection_callback"])
 
 
 def test_daemon_ignores_non_scale_devices(tmp_path: Any) -> None:

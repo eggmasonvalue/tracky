@@ -27,13 +27,14 @@ Linux is the sole BLE and wire-protocol owner. MCP and Android are projections o
 | `linux/src/tracky_mcp/acquisition/` | Acquisition lifecycle and persistence coordination |
 | `linux/src/tracky_mcp/storage/` | Canonical SQLite records and evidence |
 | `linux/src/tracky_mcp/daemon.py` | Always-on acquisition process |
-| `linux/src/tracky_mcp/sync_server.py` | Android-facing observation endpoint; replacement contract pending |
-| `linux/src/tracky_mcp/mcp/` | Agent-facing MCP adapter; read-only conversion pending |
+| `linux/src/tracky_mcp/sync_server.py` | Authenticated, read-only Android observation endpoint |
+| `linux/src/tracky_mcp/mcp/` | Agent-facing on-demand, read-only MCP adapter |
 | `linux/fixtures/` | Sanitized protocol evidence and decoder goldens |
-| `android/` | Health Connect bridge; legacy direct-BLE code pending removal |
+| `android/` | Non-launcher Health Connect projection, secure sync, WorkManager, and minimal import ledger |
 | `skills/bia-analyst/` | Read-only agent workflow over MCP evidence |
 | `contracts/` | Cross-component schemas, identity, cursor, and idempotency rules |
 | `context/PROTOCOL.md` | Evidence grades and protocol knowledge |
+| `context/DERIVATION.md` | Established BIA inputs, rejected coefficients, and derivation gate |
 | `context/DEPLOYMENT.md` | Target runtime topology and deployment gates |
 | `.pi/todos/` | Live implementation state and acceptance criteria |
 
@@ -49,15 +50,21 @@ Read Linux history on demand. Present evidence and supported interpretations to 
 
 ### Android
 
-Synchronize observations, read height from Health Connect, collect required profile inputs unavailable there, run only validated versioned derivations, and idempotently project supported records into Health Connect. Keep only the minimum import ledger. Android is neither an acquisition client nor a backup.
+Synchronize Linux-owned observations, read the latest applicable height from Health Connect
+without writing height, and idempotently project supported records. Weight projection is
+implemented. Derived-metric projection and any additional profile inputs remain gated on recovering
+the exact QN scale-family formulas for the established 20/100 kHz segmental inputs and recording
+their coefficients, applicability rules, and vendor-output parity. WorkManager owns constrained retries and the minimal
+import/idempotency ledger. Android is a non-launcher integration surface, not an acquisition
+client or backup.
 
 ## Current migration boundary
 
-The repository layout and documentation reflect the target ownership model. Current code still contains conflicting implementation that the open todos remove:
+The repository now follows the target ownership model. Remaining open work is operational or validation-focused:
 
-- Android BLE, protocol, evidence-store, manual weigh-in, and unsupported metric code.
-- MCP acquisition/configuration tools and acquisition-service startup recovery.
-- A lossy and insufficiently secured sync endpoint.
-- A Linux daemon scanner mode, completion policy, and systemd unit that are not deployment-ready.
+- Android endpoint deployment and connected-device Health Connect validation.
+- Recovery and implementation of the exact QN scale-family BIA formulas with traceable coefficients and vendor-output parity; derived metrics remain disabled until then.
+- Debian service hardening, installation, and live BLE/reboot verification.
+- Root CI and shared-fixture integration.
 
 Read `todo list` for current work rather than expanding this file into a status log.

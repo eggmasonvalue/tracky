@@ -10,7 +10,7 @@
   unit write was `13092001100000004d`, so `unit_byte=0x01` is direct wire
   evidence for this kg path.
 - The observer prompt was barefoot on the scale plus handle contact. This run
-  is therefore not a feet-only control. Resistance-bearing 0x10 frames were
+  is therefore not a feet-only control. Word-block 0x10 frames were
   observed, consistent with reaching the handle/BIA path.
 - Source references are ignored
   `captures/handshake-20260809T191051Z.jsonl` and
@@ -23,7 +23,7 @@ The handshake shape matches the first fixture:
 3. FFF1 0x14 response, followed by FFF2 0x20 time sync.
 4. FFF1 0x21 response, followed by two FFF2 0xA0 writes.
 5. Repeated FFF1 0x10 live frames, first weight-only and then
-   resistance-bearing.
+   word-block.
 
 Only FFF1 notifications were enabled. AE02 was discovered but not used. No
 runtime Feelfit, Yolanda SDK, or vendor cloud dependency is implied by this
@@ -34,14 +34,14 @@ capture.
 - **Weight — high confidence:** the stable weight-only frame
   `1012201edc0011000000000000000000004d` has `0x1edc = 7900` at bytes 3–4.
   Applying the confirmed big-endian `/100` formula gives **79.00 kg**. The
-  same value repeats in the resistance-bearing frame variant.
+  same value repeats in the word-block frame variant.
 - The expected golden intentionally uses the weight-only frame. The capture
   script's `weight_hypothesis` records used legacy offsets and are omitted
   from the fixture; the fixture hypotheses use the protocol decoder instead.
-- A repeated resistance-bearing example is
+- A repeated word-block example is
   `1012201edc01210d770bba0df90c140d5e38`, with raw words
   `[3447, 3002, 3577, 3092, 3422]` at bytes 7–16. The five-word boundary is
-  repeatable, but ohms, frequency, segment order, and body-composition meaning
+  repeatable, but units, frequency, ordering, and body-composition meaning
   remain unproven. These values are kept unitless.
 - `b5=0x00,b6=0x11` marks the weight-only example; `b5=0x01,b6=0x21` occurs
   with the five-word block. Their exact status/stability meanings remain open.

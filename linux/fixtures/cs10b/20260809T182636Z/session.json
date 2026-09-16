@@ -180,7 +180,7 @@
     },
     {
       "step": 8,
-      "description": "FFF1 notify: repeated 0x10 live frames, weight-only then resistance-bearing frames.",
+      "description": "FFF1 notify: repeated 0x10 live frames, weight-only then word-block frames.",
       "event_ids": [
         "e022",
         "e023",
@@ -343,9 +343,9 @@
         "formula_candidate": "sum(frame[:-1]) & 0xff",
         "matches": true
       },
-      "resistance_raw": []
+      "opaque_words": []
     },
-    "resistance_0x10_examples": [
+    "opaque_word_block_0x10_examples": [
       {
         "opcode": "0x10",
         "frame_hex": "1012201ee601210d2c0b790d810bbe0d3cc5",
@@ -363,16 +363,16 @@
           "formula_candidate": "sum(frame[:-1]) & 0xff",
           "matches": true
         },
-        "resistance_raw": [
+        "opaque_words": [
           3372,
           2937,
           3457,
           3006,
           3388
         ],
-        "resistance_layout_candidate": "five consecutive big-endian u16 values at bytes 7..16",
-        "resistance_unit": null,
-        "resistance_confidence": "low: field boundary and repetition are clear; ohms/frequency/segment meaning is unproven"
+        "word_layout_candidate": "five consecutive big-endian u16 values at bytes 7..16",
+        "word_unit": null,
+        "word_confidence": "low: field boundary and repetition are clear; units/frequency/ordering meaning is unproven"
       },
       {
         "opcode": "0x10",
@@ -391,16 +391,16 @@
           "formula_candidate": "sum(frame[:-1]) & 0xff",
           "matches": true
         },
-        "resistance_raw": [
+        "opaque_words": [
           3395,
           2941,
           3540,
           3065,
           3389
         ],
-        "resistance_layout_candidate": "five consecutive big-endian u16 values at bytes 7..16",
-        "resistance_unit": null,
-        "resistance_confidence": "low: field boundary and repetition are clear; ohms/frequency/segment meaning is unproven"
+        "word_layout_candidate": "five consecutive big-endian u16 values at bytes 7..16",
+        "word_unit": null,
+        "word_confidence": "low: field boundary and repetition are clear; units/frequency/ordering meaning is unproven"
       },
       {
         "opcode": "0x10",
@@ -419,16 +419,16 @@
           "formula_candidate": "sum(frame[:-1]) & 0xff",
           "matches": true
         },
-        "resistance_raw": [
+        "opaque_words": [
           3386,
           2950,
           3516,
           3050,
           3392
         ],
-        "resistance_layout_candidate": "five consecutive big-endian u16 values at bytes 7..16",
-        "resistance_unit": null,
-        "resistance_confidence": "low: field boundary and repetition are clear; ohms/frequency/segment meaning is unproven"
+        "word_layout_candidate": "five consecutive big-endian u16 values at bytes 7..16",
+        "word_unit": null,
+        "word_confidence": "low: field boundary and repetition are clear; units/frequency/ordering meaning is unproven"
       }
     ]
   },

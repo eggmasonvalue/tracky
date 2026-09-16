@@ -50,6 +50,28 @@ Tradeoff: Health Connect and agent output may initially be weight-only, but futu
 
 Status: active
 
+## 2026-09-17 — Recover scale-family derivation behavior
+
+Context: No transparent modern prediction equation was found whose declared inputs
+match Tracky's five-segment 20/100 kHz scalar impedance values. Published equations
+use incompatible frequencies, electrical quantities, electrode paths, or calibration
+populations, while matching commercial devices keep their algorithms undisclosed.
+The QN SDK confirms that its native calculator consumes Tracky's exact profile and
+ten-channel inputs, but its coefficient banks exist only in stripped native binaries.
+
+Decision: Recover and independently reimplement the exact QN scale-family derivation
+behavior from inspectable public artifacts. Do not ship vendor binaries. Require an
+immutable algorithm version, coefficient-to-operand provenance, applicability rules,
+and vendor-output golden vectors before enabling derived records. Describe successful
+parity as vendor compatibility, not independent clinical validation.
+
+Tradeoff: This can restore the intended smart-scale outputs without transplanting
+incompatible academic equations, but reverse engineering is more costly and vendor
+parity alone does not establish physiological accuracy. Derived records remain
+disabled until the recovery and validation gates pass.
+
+Status: active
+
 ## 2026-09-16 — Android uses Health Connect profile data without owning it
 
 Context: Derivation may require profile inputs. Health Connect provides height as a time-series record but has no equivalent stable fitness records for every potentially required input.

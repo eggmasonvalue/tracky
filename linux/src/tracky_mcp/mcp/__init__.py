@@ -1,4 +1,4 @@
-"""Optional stateless MCP 2026-07-28 adapter.
+"""Optional on-demand, read-only MCP history adapter.
 
 The base package remains importable without the ``mcp`` extra. Call
 :func:`create_server` only in an MCP-enabled installation.
@@ -11,16 +11,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from mcp.server import MCPServer
 
-    from tracky_mcp.acquisition import AcquisitionService, DeviceService
     from tracky_mcp.storage import SQLiteMeasurementStore
 
 
-def create_server(
-    store: SQLiteMeasurementStore,
-    *,
-    devices: DeviceService | None = None,
-    acquisitions: AcquisitionService | None = None,
-) -> MCPServer:
+def create_server(store: SQLiteMeasurementStore) -> MCPServer:
     """Lazily build the server so protocol/BLE/storage installs need no MCP SDK."""
 
     try:
@@ -33,7 +27,7 @@ def create_server(
                 "with `python -m pip install -e '.[mcp]'`."
             ) from exc
         raise
-    return build_server(store, devices=devices, acquisitions=acquisitions)
+    return build_server(store)
 
 
 __all__ = ["create_server"]

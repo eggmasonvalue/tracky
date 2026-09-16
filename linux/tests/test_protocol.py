@@ -8,10 +8,11 @@ from pathlib import Path
 import pytest
 
 from tracky_mcp.protocol import (
+    BurstAssembler,
     InfoFrame,
     MeasurementFrame,
+    OpaqueBurst,
     ScaleSession,
-    SegmentalBioimpedance,
     SessionState,
     StatusFrame,
     WeightUnit,
@@ -71,22 +72,21 @@ def test_weight_golden(expected_decode: dict) -> None:
     assert decoded.weight_raw_u16_be == expected_decode["weight_raw_u16_be"]
     assert decoded.weight_formula == expected_decode["weight_formula"]
     assert decoded.weight_kg == expected_decode["weight_kg"]
-    assert decoded.resistance_raw == expected_decode["resistance_raw"]
-    assert decoded.resistance_unit is None
+    assert decoded.word_block == expected_decode["opaque_words"]
+    assert decoded.word_provenance.startswith("Opaque five-word block")
     assert decoded.checksum_valid is True
 
 
-def test_resistance_block_is_structured_but_unitless(session_fixture: dict) -> None:
-    examples = session_fixture["decode_hypotheses"]["resistance_0x10_examples"]
+def test_word_block_is_structured_but_opaque(session_fixture: dict) -> None:
+    examples = session_fixture["decode_hypotheses"]["opaque_word_block_0x10_examples"]
 
     for example in examples:
         decoded = decode_frame(example["frame_hex"])
         assert isinstance(decoded, MeasurementFrame)
         assert decoded.b5 == 0x01
         assert decoded.b6 == 0x21
-        assert decoded.resistance_raw == example["resistance_raw"]
-        assert decoded.resistance_layout is not None
-        assert decoded.resistance_unit is None
+        assert decoded.word_block == example["opaque_words"]
+        assert decoded.word_layout is not None
 
 
 def test_recorded_notifications_decode_and_checksum(session_fixture: dict) -> None:
@@ -174,8 +174,7 @@ def test_build_over_cmd() -> None:
 
 def test_packet2_decode_and_burst_reassembly() -> None:
     # Packet 1: weight 78.90 kg (0x1ed2), b5=0x01, b6=0x21
-    # raw resistance: [4549, 4215, 2190, 2039, 133]
-    # lf20k=4549, lf100k=4215, rf20k=2190, rf100k=2039, lh20k=133
+    # First opaque block: [4549, 4215, 2190, 2039, 133].
     p1_bytes = append_checksum(
         bytes(
             (
@@ -187,12 +186,11 @@ def test_packet2_decode_and_burst_reassembly() -> None:
     p1 = decode_frame(p1_bytes)
     assert isinstance(p1, MeasurementFrame)
     assert p1.b6 == 0x21
-    assert p1.resistance_raw == [4549, 4215, 2190, 2039, 133]
-    assert "packet 1/2" in (p1.resistance_layout or "")
+    assert p1.word_block == [4549, 4215, 2190, 2039, 133]
+    assert "packet 1/2" in (p1.word_layout or "")
 
     # Packet 2: weight 78.90 kg (0x1ed2), b5=0x01, b6=0x22
-    # raw resistance: [116, 140, 122, 230, 200]
-    # lh100k=116, rh20k=140, rh100k=122, t20k=230, t100k=200
+    # Second opaque block: [116, 140, 122, 230, 200].
     p2_bytes = append_checksum(
         bytes(
             (
@@ -204,27 +202,42 @@ def test_packet2_decode_and_burst_reassembly() -> None:
     p2 = decode_frame(p2_bytes)
     assert isinstance(p2, MeasurementFrame)
     assert p2.b6 == 0x22
-    assert p2.resistance_raw == [116, 140, 122, 230, 200]
-    assert "packet 2/2" in (p2.resistance_layout or "")
+    assert p2.word_block == [116, 140, 122, 230, 200]
+    assert "packet 2/2" in (p2.word_layout or "")
 
     burst = reassemble_burst(p1, p2)
-    assert isinstance(burst, SegmentalBioimpedance)
-    assert burst.lf20k == 4549
-    assert burst.lf100k == 4215
-    assert burst.rf20k == 2190
-    assert burst.rf100k == 2039
-    assert burst.lh20k == 133
-    assert burst.lh100k == 116
-    assert burst.rh20k == 140
-    assert burst.rh100k == 122
-    assert burst.t20k == 230
-    assert burst.t100k == 200
-    assert burst.weight_kg == 78.90
+    assert isinstance(burst, OpaqueBurst)
+    assert burst.block_a == (4549, 4215, 2190, 2039, 133)
+    assert burst.block_b == (116, 140, 122, 230, 200)
+    assert burst.opaque_words == (
+        4549, 4215, 2190, 2039, 133, 116, 140, 122, 230, 200
+    )
+    assert burst.wire_valid is True
+    assert not hasattr(burst, "ohms")
+    assert not hasattr(burst, "fluid_ratio")
 
-    assert burst.raw_channels == [4549, 4215, 2190, 2039, 133, 116, 140, 122, 230, 200]
-    assert burst.ohms["lf20k"] == 454.9
-    assert burst.ohms["t100k"] == 20.0
-    assert burst.fluid_ratio is not None
+
+def test_bad_checksum_cannot_assemble_a_burst() -> None:
+    p1 = decode_frame(
+        append_checksum(
+            bytes((0x10, 0x12, 0x20, 0x1E, 0xD2, 0x01, 0x21, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5))
+        )
+    )
+    p2 = decode_frame(
+        append_checksum(
+            bytes((0x10, 0x12, 0x20, 0x1E, 0xD2, 0x01, 0x22, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10))
+        )
+    )
+    assert isinstance(p1, MeasurementFrame)
+    assert isinstance(p2, MeasurementFrame)
+    invalid = bytearray(p1.raw)
+    invalid[-1] ^= 1
+    invalid_frame = decode_frame(invalid)
+    assembler = BurstAssembler()
+    assert isinstance(invalid_frame, MeasurementFrame)
+    assert assembler.add(invalid_frame) is None
+    assert assembler.add(p2) is None
+    assert assembler.completed == []
 
 
 def test_session_burst_flow() -> None:
@@ -262,6 +275,6 @@ def test_session_burst_flow() -> None:
     out2 = session.feed(p2_bytes)
     assert len(out2.tx_writes) == 0
     assert len(session.bursts) == 1
-    assert session.bursts[0].lf20k == 4549
-    assert session.bursts[0].t100k == 200
+    assert session.bursts[0].block_a == (4549, 4215, 2190, 2039, 133)
+    assert session.bursts[0].block_b == (116, 140, 122, 230, 200)
 

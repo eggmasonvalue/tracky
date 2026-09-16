@@ -11,5 +11,6 @@ ignores:
   - ".gradle/**"
   - ".kotlin/**"
   - ".pi/**"
+  - "**/.venv/**"
   - "app/build/**"
   - "build/**"

@@ -27,28 +27,28 @@ The sync API is a separate, narrowly scoped read path over the daemon's SQLite s
 - Define whether health is public; the safer default is to authenticate it as well. Return only completed, sync-eligible sessions and use an idempotent cursor that cannot skip equal-time records.
 - Run the API under the dedicated service account with only the state-directory access it needs. Prefer a read-only database connection or a separate read-only export/snapshot once the concurrency strategy is chosen.
 
-The current `linux/src/tracky_mcp/sync_server.py` is not ready for this boundary: authentication is optional, HTTP is cleartext, binding is broad by default, CORS is permissive, and the cursor is not a durable acknowledgement.
+The checked-in sync server now requires bearer authentication, defaults to loopback, opens SQLite read-only, supports direct TLS or explicit loopback-only external TLS termination, and uses opaque keyset cursors. Deployment still requires provisioning the certificate or trusted proxy, token file, firewall policy, rate limiting at the proxy, and end-to-end verification.
 
 ## MCP
 
 - Do not install MCP as a permanently running system daemon.
 - Launch it on demand through the local MCP host using stdio, with the same approved state/read path and no BLE ownership.
-- Expose only read-only device/session/operation/frame resources and approved read-only tools. Remove or gate discovery, configuration, start, stop, cancel, and other mutations from the deployment profile.
+- Expose only the bounded read-only session history tools `list_sessions`, `get_latest_session`, `get_session`, and `get_session_evidence`, plus canonical session/frame resources. The MCP process does not instantiate acquisition or perform operation recovery.
 - Keep the MCP process account and filesystem access least-privileged. It must not receive sync tokens or write access unless a separately reviewed administrative mode is introduced.
 
-The current MCP implementation contains mutating acquisition tools, so it must not be described as the target read-only profile yet.
+The checked-in MCP implementation now matches this on-demand read-only profile; deployment still requires least-privilege filesystem and process setup.
 
 ## Android setup
 
 1. Install the Android bridge with a compatible Health Connect provider. Configure the authenticated sync endpoint and secret through the onboarding flow; ship no environment-specific endpoint or plaintext production token.
-2. Through onboarding, grant read access to height and write access only to approved output records. Tracky reads the latest applicable `HeightRecord` and never writes height.
+2. Through onboarding, grant read access to height and historical health data, plus write access only to approved output records. Tracky reads the latest applicable `HeightRecord` and never writes height.
 3. Collect required profile inputs that Health Connect does not provide. Store no fabricated defaults and permit later correction.
 4. Enable WorkManager with network constraints, retry/backoff, request timeouts, and idempotency. Advance a cursor only after every eligible record has a durable success or quarantine disposition.
 5. Keep only the minimum import ledger on Android. Use stable `clientRecordId` and `clientRecordVersion` metadata for Health Connect upserts.
 6. Expose onboarding, permission rationale, and actionable diagnostics without an ordinary launcher entry.
 7. Test the complete path: daemon capture to SQLite, authenticated API retrieval, Android validation and retry behavior, Health Connect permission handling, and duplicate/replay safety.
 
-The checked-in Android application still requests Bluetooth permissions and contains direct acquisition code. Remove that superseded behavior before deployment.
+The checked-in Android application now has no Bluetooth permission, feature, transport, scale protocol, evidence store, or ordinary launcher entry. It still requires endpoint/TLS deployment and connected-device Health Connect validation before release.
 
 ## Go-live gate
 

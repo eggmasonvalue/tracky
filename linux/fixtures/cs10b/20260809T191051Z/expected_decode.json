@@ -6,5 +6,5 @@
   "weight_formula": "int.from_bytes(frame[3:5], 'big') / 100",
   "weight_kg": 79.0,
   "confidence": "high",
-  "resistance_raw": []
+  "opaque_words": []
 }

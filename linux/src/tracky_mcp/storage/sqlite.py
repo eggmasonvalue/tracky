@@ -16,11 +16,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tracky_mcp.protocol import (
     DECODER_ID,
     DECODER_VERSION,
+    QUALITY_VERSION,
+    WEIGHT_SELECTION_POLICY_VERSION,
     CommandFrame,
     DecodedFrame,
     FrameDecodeError,
     InfoFrame,
     MeasurementFrame,
+    MeasurementQuality,
     StatusFrame,
     UnknownFrame,
     decode_frame,
@@ -31,15 +34,37 @@ from .models import (
     DeviceConnection,
     KnownDevice,
     MeasurementSession,
+    MeasurementSessionSummary,
     OperationStatus,
     SessionStatus,
     StoredFrame,
     StoredMeasurement,
 )
 
-SCHEMA_REVISION = 3
+SCHEMA_REVISION = 5
 DEFAULT_DISPLAY_TIMEZONE = "Asia/Kolkata"
 DEFAULT_DB_FILENAME = "tracky.sqlite3"
+
+_SESSION_SUMMARY_QUERY = """
+SELECT
+    s.*,
+    (
+        SELECT COUNT(*)
+        FROM frames AS f
+        WHERE f.session_id = s.id
+    ) AS frame_count,
+    (
+        SELECT COUNT(*)
+        FROM measurement_frames AS m
+        WHERE m.session_id = s.id
+    ) AS measurement_frame_count,
+    (
+        SELECT GROUP_CONCAT(DISTINCT f.decoder_version)
+        FROM frames AS f
+        WHERE f.session_id = s.id
+    ) AS decoder_versions
+FROM measurement_sessions AS s
+"""
 
 _SCHEMA = """
 CREATE TABLE known_devices (
@@ -70,7 +95,16 @@ CREATE TABLE measurement_sessions (
     condition TEXT,
     capture_id TEXT UNIQUE,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    quality TEXT NOT NULL DEFAULT 'indeterminate' CHECK (
+        quality IN ('accepted', 'contact_failed', 'indeterminate')
+    ),
+    quality_version INTEGER NOT NULL DEFAULT 1 CHECK (quality_version >= 1),
+    quality_reason TEXT,
+    completion_reason TEXT,
     selected_frame_sequence INTEGER,
+    selection_policy_version INTEGER CHECK (
+        selection_policy_version IS NULL OR selection_policy_version >= 1
+    ),
     CHECK (ended_at_utc IS NULL OR ended_at_utc >= started_at_utc),
     FOREIGN KEY (id, selected_frame_sequence)
         REFERENCES frames(session_id, sequence)
@@ -130,15 +164,15 @@ CREATE TABLE measurement_frames (
     weight_provenance TEXT NOT NULL,
     b5 INTEGER NOT NULL CHECK (b5 BETWEEN 0 AND 255),
     b6 INTEGER NOT NULL CHECK (b6 BETWEEN 0 AND 255),
-    resistance_layout TEXT,
-    resistance_unit TEXT,
-    resistance_provenance TEXT NOT NULL,
+    word_layout TEXT,
+    word_provenance TEXT NOT NULL,
+    opaque_unit_evidence TEXT,
     PRIMARY KEY (session_id, sequence),
     FOREIGN KEY (session_id, sequence)
         REFERENCES frames(session_id, sequence) ON DELETE RESTRICT
 ) STRICT;
 
-CREATE TABLE resistance_values (
+CREATE TABLE word_values (
     session_id TEXT NOT NULL,
     frame_sequence INTEGER NOT NULL,
     value_index INTEGER NOT NULL CHECK (value_index >= 0),
@@ -262,7 +296,8 @@ def _decoded_fields(frame: DecodedFrame) -> dict[str, Any]:
                 "weight_unit": frame.weight_unit,
                 "b5": frame.b5,
                 "b6": frame.b6,
-                "resistance_raw": list(frame.resistance_raw),
+                "opaque_words": list(frame.word_block),
+                "opaque_unit_evidence": frame.opaque_unit_evidence,
             }
         )
     elif isinstance(frame, InfoFrame):
@@ -309,26 +344,54 @@ def _frame_kind(frame: DecodedFrame) -> str:
     return type(frame).__name__
 
 
+def _quality_value(value: MeasurementQuality | str) -> str:
+    return MeasurementQuality(value).value
+
+
+def _decoder_versions(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return ()
+    return tuple(sorted({int(part) for part in value.split(",")}))
+
+
 class SQLiteMeasurementStore:
     """Persist complete sessions while retaining every raw frame losslessly.
 
-    The initial alpha schema has a revision marker but no migration machinery.
-    An unknown revision fails loudly so an experimental database is never
-    reinterpreted under the wrong layout.
+    Revision 3 databases migrate transactionally to the current layout while
+    preserving evidence. An unknown revision fails loudly so an experimental
+    database is never reinterpreted under the wrong layout.
     """
 
-    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        read_only: bool = False,
+    ) -> None:
         selected = default_database_path() if path is None else Path(path)
         self.path = selected
+        self.read_only = read_only
         self._memory = str(selected) == ":memory:"
-        if not self._memory:
+        if self.read_only and self._memory:
+            raise ValueError("an in-memory database cannot be opened read-only")
+        if not self.read_only and not self._memory:
             selected.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(str(selected))
+        if self.read_only:
+            if not selected.is_file():
+                raise StorageError(f"read-only database does not exist: {selected}")
+            self._connection = sqlite3.connect(
+                f"{selected.resolve().as_uri()}?mode=ro",
+                uri=True,
+            )
+        else:
+            self._connection = sqlite3.connect(str(selected))
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
+        if self.read_only:
+            self._connection.execute("PRAGMA query_only = ON")
         self._initialize()
-        if not self._memory:
+        if not self.read_only and not self._memory:
             try:
                 selected.chmod(0o600)
             except OSError:
@@ -337,16 +400,99 @@ class SQLiteMeasurementStore:
     def _initialize(self) -> None:
         revision = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
         if revision == 0:
+            if self.read_only:
+                raise SchemaRevisionError("read-only database has no initialized schema")
             with self._connection:
                 self._connection.executescript(_SCHEMA)
                 self._connection.execute(f"PRAGMA user_version = {SCHEMA_REVISION}")
             if not self._memory:
                 self._connection.execute("PRAGMA journal_mode = WAL")
             return
+        if revision == 3:
+            if self.read_only:
+                raise SchemaRevisionError(
+                    "read-only database is revision 3; migrate it with the acquisition store"
+                )
+            self._migrate_revision_3_to_4()
+            revision = 4
+        if revision == 4:
+            if self.read_only:
+                raise SchemaRevisionError(
+                    "read-only database is revision 4; migrate it with the acquisition store"
+                )
+            self._migrate_revision_4_to_5()
+            revision = 5
         if revision != SCHEMA_REVISION:
             raise SchemaRevisionError(
                 f"database schema revision {revision} is unsupported; expected {SCHEMA_REVISION}"
             )
+
+    def _migrate_revision_3_to_4(self) -> None:
+        """Upgrade the shipped revision-3 layout without rewriting evidence.
+
+        SQLite's transactional column/table renames retain every row, raw blob,
+        timestamp, checksum value, decoded JSON field, and foreign-key link.
+        The former unit column is retained under an explicitly opaque name
+        rather than being discarded or reinterpreted.
+        """
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                """
+                ALTER TABLE measurement_sessions
+                ADD COLUMN quality TEXT NOT NULL DEFAULT 'indeterminate'
+                CHECK (quality IN ('accepted', 'contact_failed', 'indeterminate'))
+                """
+            )
+            self._connection.execute(
+                """
+                ALTER TABLE measurement_sessions
+                ADD COLUMN quality_version INTEGER NOT NULL DEFAULT 1
+                CHECK (quality_version >= 1)
+                """
+            )
+            self._connection.execute(
+                "ALTER TABLE measurement_sessions ADD COLUMN quality_reason TEXT"
+            )
+            self._connection.execute(
+                "ALTER TABLE measurement_sessions ADD COLUMN completion_reason TEXT"
+            )
+            self._connection.execute(
+                "ALTER TABLE measurement_frames RENAME COLUMN resistance_layout TO word_layout"
+            )
+            self._connection.execute(
+                "ALTER TABLE measurement_frames RENAME COLUMN resistance_provenance "
+                "TO word_provenance"
+            )
+            self._connection.execute(
+                "ALTER TABLE measurement_frames RENAME COLUMN resistance_unit "
+                "TO opaque_unit_evidence"
+            )
+            self._connection.execute("ALTER TABLE resistance_values RENAME TO word_values")
+            self._connection.execute("PRAGMA user_version = 4")
+            self._connection.commit()
+        except sqlite3.DatabaseError as exc:
+            self._connection.rollback()
+            raise SchemaRevisionError("database schema revision 3 migration failed") from exc
+
+    def _migrate_revision_4_to_5(self) -> None:
+        """Add explicit provenance for the Linux weight-selection policy."""
+
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                """
+                ALTER TABLE measurement_sessions
+                ADD COLUMN selection_policy_version INTEGER
+                CHECK (selection_policy_version IS NULL OR selection_policy_version >= 1)
+                """
+            )
+            self._connection.execute(f"PRAGMA user_version = {SCHEMA_REVISION}")
+            self._connection.commit()
+        except sqlite3.DatabaseError as exc:
+            self._connection.rollback()
+            raise SchemaRevisionError("database schema revision 4 migration failed") from exc
 
     def close(self) -> None:
         self._connection.close()
@@ -600,8 +746,13 @@ class SQLiteMeasurementStore:
         finished_at: datetime,
         error_code: str | None = None,
         error_message: str | None = None,
+        quality: MeasurementQuality | str = MeasurementQuality.INDETERMINATE,
+        quality_reason: str | None = None,
+        completion_reason: str | None = None,
+        selected_frame_sequence: int | None = None,
+        selection_policy_version: int | None = None,
     ) -> None:
-        """Atomically close a running operation and its linked session."""
+        """Atomically close an operation and persist quality and selection provenance."""
 
         if status not in {
             OperationStatus.COMPLETE,
@@ -613,7 +764,20 @@ class SQLiteMeasurementStore:
             raise ValueError("a completed acquisition cannot carry an error")
         if status is not OperationStatus.COMPLETE and not error_code:
             raise ValueError("a failed or cancelled acquisition requires an error code")
+        if status is not OperationStatus.COMPLETE:
+            selected_frame_sequence = None
+            selection_policy_version = None
+        if selected_frame_sequence is None and selection_policy_version is not None:
+            raise ValueError("selection policy version requires a selected frame")
+        if selected_frame_sequence is not None and selection_policy_version is None:
+            raise ValueError("a selected frame requires a selection policy version")
+        if (
+            selected_frame_sequence is not None
+            and selection_policy_version != WEIGHT_SELECTION_POLICY_VERSION
+        ):
+            raise ValueError("unsupported weight selection policy version")
         finished_text = _timestamp(finished_at, name="finished_at")
+        quality_text = _quality_value(quality)
         session_status = (
             SessionStatus.COMPLETE
             if status is OperationStatus.COMPLETE
@@ -635,13 +799,38 @@ class SQLiteMeasurementStore:
             if operation["session_id"] != session_id:
                 raise ValueError("operation is not linked to the supplied session")
             self._require_open(session_id)
+            if selected_frame_sequence is not None:
+                selected = self._connection.execute(
+                    """
+                    SELECT 1 FROM measurement_frames AS m
+                    JOIN frames AS f
+                      ON f.session_id = m.session_id AND f.sequence = m.sequence
+                    WHERE m.session_id = ? AND m.sequence = ?
+                      AND f.checksum_valid = 1
+                    """,
+                    (session_id, selected_frame_sequence),
+                ).fetchone()
+                if selected is None:
+                    raise ValueError("selected frame must be a wire-valid measurement")
             self._connection.execute(
                 """
                 UPDATE measurement_sessions
-                SET status = ?, ended_at_utc = ?
+                SET status = ?, ended_at_utc = ?, quality = ?, quality_version = ?,
+                    quality_reason = ?, completion_reason = ?,
+                    selected_frame_sequence = ?, selection_policy_version = ?
                 WHERE id = ?
                 """,
-                (session_status.value, finished_text, session_id),
+                (
+                    session_status.value,
+                    finished_text,
+                    quality_text,
+                    QUALITY_VERSION,
+                    quality_reason,
+                    completion_reason,
+                    selected_frame_sequence,
+                    selection_policy_version,
+                    session_id,
+                ),
             )
             self._connection.execute(
                 """
@@ -759,10 +948,15 @@ class SQLiteMeasurementStore:
             self._connection.executemany(
                 """
                 UPDATE measurement_sessions
-                SET status = 'aborted', ended_at_utc = ?
+                SET status = 'aborted', ended_at_utc = ?, quality = ?,
+                    quality_version = ?, quality_reason = ?, completion_reason = ?
                 WHERE id = ? AND status = 'open'
                 """,
-                ((recovered_text, session_id) for session_id in session_ids),
+                (
+                    (recovered_text, MeasurementQuality.INDETERMINATE.value, QUALITY_VERSION,
+                     "process_restarted", "process_restarted", session_id)
+                    for session_id in session_ids
+                ),
             )
             self._connection.execute(
                 """
@@ -946,8 +1140,8 @@ class SQLiteMeasurementStore:
             INSERT INTO measurement_frames (
                 session_id, sequence, protocol_type, weight_raw_u16_be,
                 weight_scale_divisor, weight_unit, weight_formula,
-                weight_provenance, b5, b6, resistance_layout,
-                resistance_unit, resistance_provenance
+                weight_provenance, b5, b6, word_layout, word_provenance,
+                opaque_unit_evidence
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -961,20 +1155,20 @@ class SQLiteMeasurementStore:
                 frame.weight_provenance,
                 frame.b5,
                 frame.b6,
-                frame.resistance_layout,
-                frame.resistance_unit,
-                frame.resistance_provenance,
+                frame.word_layout,
+                frame.word_provenance,
+                frame.opaque_unit_evidence,
             ),
         )
         self._connection.executemany(
             """
-            INSERT INTO resistance_values (
+            INSERT INTO word_values (
                 session_id, frame_sequence, value_index, raw_value
             ) VALUES (?, ?, ?, ?)
             """,
             (
                 (session_id, sequence, index, value)
-                for index, value in enumerate(frame.resistance_raw)
+                for index, value in enumerate(frame.word_block)
             ),
         )
 
@@ -984,45 +1178,187 @@ class SQLiteMeasurementStore:
         *,
         ended_at: datetime,
         selected_frame_sequence: int | None = None,
+        selection_policy_version: int | None = None,
+        quality: MeasurementQuality | str = MeasurementQuality.INDETERMINATE,
+        quality_reason: str | None = None,
+        completion_reason: str | None = None,
     ) -> None:
-        """Mark a session complete, optionally referencing a measurement frame."""
+        """Mark a session complete without conflating quality and lifecycle."""
 
         ended_text = _timestamp(ended_at, name="ended_at")
+        quality_text = _quality_value(quality)
+        if selected_frame_sequence is None and selection_policy_version is not None:
+            raise ValueError("selection policy version requires a selected frame")
+        if selected_frame_sequence is not None and selection_policy_version is None:
+            raise ValueError("a selected frame requires a selection policy version")
+        if (
+            selected_frame_sequence is not None
+            and selection_policy_version != WEIGHT_SELECTION_POLICY_VERSION
+        ):
+            raise ValueError("unsupported weight selection policy version")
         with self._connection:
             self._require_open(session_id)
             if selected_frame_sequence is not None:
                 selected = self._connection.execute(
                     """
-                    SELECT 1 FROM measurement_frames
-                    WHERE session_id = ? AND sequence = ?
+                    SELECT 1 FROM measurement_frames AS m
+                    JOIN frames AS f
+                      ON f.session_id = m.session_id AND f.sequence = m.sequence
+                    WHERE m.session_id = ? AND m.sequence = ?
+                      AND f.checksum_valid = 1
                     """,
                     (session_id, selected_frame_sequence),
                 ).fetchone()
                 if selected is None:
-                    raise ValueError("selected frame must be a measurement in this session")
+                    raise ValueError("selected frame must be a wire-valid measurement")
             self._connection.execute(
                 """
                 UPDATE measurement_sessions
-                SET status = 'complete', ended_at_utc = ?, selected_frame_sequence = ?
+                SET status = 'complete', ended_at_utc = ?, quality = ?,
+                    quality_version = ?, quality_reason = ?, completion_reason = ?,
+                    selected_frame_sequence = ?, selection_policy_version = ?
                 WHERE id = ?
                 """,
-                (ended_text, selected_frame_sequence, session_id),
+                (
+                    ended_text,
+                    quality_text,
+                    QUALITY_VERSION,
+                    quality_reason,
+                    completion_reason,
+                    selected_frame_sequence,
+                    selection_policy_version,
+                    session_id,
+                ),
             )
 
-    def abort_session(self, session_id: str, *, ended_at: datetime) -> None:
+    def abort_session(
+        self,
+        session_id: str,
+        *,
+        ended_at: datetime,
+        quality: MeasurementQuality | str = MeasurementQuality.INDETERMINATE,
+        quality_reason: str | None = None,
+        completion_reason: str | None = None,
+    ) -> None:
         """Close an incomplete acquisition without deleting its evidence."""
 
         ended_text = _timestamp(ended_at, name="ended_at")
+        quality_text = _quality_value(quality)
         with self._connection:
             self._require_open(session_id)
             self._connection.execute(
                 """
                 UPDATE measurement_sessions
-                SET status = 'aborted', ended_at_utc = ?
+                SET status = 'aborted', ended_at_utc = ?, quality = ?,
+                    quality_version = ?, quality_reason = ?, completion_reason = ?
                 WHERE id = ?
                 """,
-                (ended_text, session_id),
+                (
+                    ended_text,
+                    quality_text,
+                    QUALITY_VERSION,
+                    quality_reason,
+                    completion_reason,
+                    session_id,
+                ),
             )
+
+    @staticmethod
+    def _session_summary(row: sqlite3.Row) -> MeasurementSessionSummary:
+        started_at = _parse_timestamp(row["started_at_utc"])
+        assert started_at is not None
+        return MeasurementSessionSummary(
+            id=row["id"],
+            status=SessionStatus(row["status"]),
+            started_at=started_at,
+            ended_at=_parse_timestamp(row["ended_at_utc"]),
+            display_timezone=row["display_timezone"],
+            device_alias=row["device_alias"],
+            model_label=row["model_label"],
+            address_hash=row["address_hash"],
+            requested_unit=row["requested_unit"],
+            condition=row["condition"],
+            capture_id=row["capture_id"],
+            metadata=json.loads(row["metadata_json"]),
+            quality=MeasurementQuality(row["quality"]),
+            quality_version=row["quality_version"],
+            quality_reason=row["quality_reason"],
+            completion_reason=row["completion_reason"],
+            selected_frame_sequence=row["selected_frame_sequence"],
+            selection_policy_version=row["selection_policy_version"],
+            frame_count=row["frame_count"],
+            measurement_frame_count=row["measurement_frame_count"],
+            decoder_versions=_decoder_versions(row["decoder_versions"]),
+        )
+
+    def get_session_summary(self, session_id: str) -> MeasurementSessionSummary:
+        """Return session metadata and counts without loading frame bodies."""
+
+        row = self._connection.execute(
+            f"{_SESSION_SUMMARY_QUERY} WHERE s.id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            raise SessionNotFoundError(session_id)
+        return self._session_summary(row)
+
+    def get_latest_session_summary(self) -> MeasurementSessionSummary | None:
+        """Return the newest session summary, or ``None`` when history is empty."""
+
+        row = self._connection.execute(
+            f"""
+            {_SESSION_SUMMARY_QUERY}
+            ORDER BY s.started_at_utc DESC, s.id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return None if row is None else self._session_summary(row)
+
+    def list_session_summaries(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        after: tuple[datetime, str] | None = None,
+    ) -> list[MeasurementSessionSummary]:
+        """Return stable newest-first summaries without frame materialization.
+
+        ``after`` is an internal keyset cursor containing the last returned
+        ``(started_at, session_id)`` pair. Ordering by both columns prevents
+        equal-timestamp sessions from being skipped or repeated.
+        """
+
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        if after is not None and offset:
+            raise ValueError("offset cannot be combined with an after cursor")
+
+        if after is None:
+            query = f"""
+                {_SESSION_SUMMARY_QUERY}
+                ORDER BY s.started_at_utc DESC, s.id DESC
+                LIMIT ? OFFSET ?
+            """
+            parameters: tuple[Any, ...] = (limit, offset)
+        else:
+            after_started_at, after_session_id = after
+            if not after_session_id:
+                raise ValueError("after cursor session ID must not be empty")
+            after_text = _timestamp(_aware(after_started_at, name="after"), name="after")
+            query = f"""
+                {_SESSION_SUMMARY_QUERY}
+                WHERE (
+                    s.started_at_utc < ?
+                    OR (s.started_at_utc = ? AND s.id < ?)
+                )
+                ORDER BY s.started_at_utc DESC, s.id DESC
+                LIMIT ?
+            """
+            parameters = (after_text, after_text, after_session_id, limit)
+
+        rows = self._connection.execute(query, parameters).fetchall()
+        return [self._session_summary(row) for row in rows]
 
     def get_session(self, session_id: str) -> MeasurementSession:
         row = self._connection.execute(
@@ -1044,12 +1380,21 @@ class SQLiteMeasurementStore:
             condition=row["condition"],
             capture_id=row["capture_id"],
             metadata=json.loads(row["metadata_json"]),
+            quality=MeasurementQuality(row["quality"]),
+            quality_version=row["quality_version"],
+            quality_reason=row["quality_reason"],
+            completion_reason=row["completion_reason"],
             selected_frame_sequence=row["selected_frame_sequence"],
+            selection_policy_version=row["selection_policy_version"],
             frames=frames,
         )
 
     def list_sessions(self, *, limit: int = 100, offset: int = 0) -> list[MeasurementSession]:
-        """Return newest sessions first, with all retained frames."""
+        """Return newest sessions first, including all retained frames.
+
+        Use :meth:`list_session_summaries` for history projections that do not
+        need the canonical evidence stream.
+        """
 
         if limit < 1 or limit > 1000:
             raise ValueError("limit must be between 1 and 1000")
@@ -1069,12 +1414,15 @@ class SQLiteMeasurementStore:
         self,
         *,
         since: datetime | None = None,
+        after_session_id: str | None = None,
         limit: int = 100,
     ) -> list[MeasurementSession]:
-        """Return sessions started strictly after `since` in chronological order."""
+        """Return sessions after a chronological `(started_at, id)` cursor."""
 
         if limit < 1 or limit > 1000:
             raise ValueError("limit must be between 1 and 1000")
+        if since is None and after_session_id is not None:
+            raise ValueError("after_session_id requires since")
         if since is None:
             rows = self._connection.execute(
                 """
@@ -1086,14 +1434,20 @@ class SQLiteMeasurementStore:
             ).fetchall()
         else:
             since_text = _timestamp(_aware(since, name="since"), name="since")
+            if after_session_id is None:
+                predicate = "started_at_utc > ?"
+                parameters: tuple[Any, ...] = (since_text, limit)
+            else:
+                predicate = "(started_at_utc > ? OR (started_at_utc = ? AND id > ?))"
+                parameters = (since_text, since_text, after_session_id, limit)
             rows = self._connection.execute(
-                """
+                f"""
                 SELECT id FROM measurement_sessions
-                WHERE started_at_utc > ?
+                WHERE {predicate}
                 ORDER BY started_at_utc ASC, id ASC
                 LIMIT ?
                 """,
-                (since_text, limit),
+                parameters,
             ).fetchall()
         return [self.get_session(row["id"]) for row in rows]
 
@@ -1102,8 +1456,8 @@ class SQLiteMeasurementStore:
             """
             SELECT f.*, m.protocol_type, m.weight_raw_u16_be,
                    m.weight_scale_divisor, m.weight_unit, m.weight_formula,
-                   m.weight_provenance, m.b5, m.b6, m.resistance_layout,
-                   m.resistance_unit, m.resistance_provenance
+                   m.weight_provenance, m.b5, m.b6, m.word_layout,
+                   m.word_provenance, m.opaque_unit_evidence
             FROM frames AS f
             LEFT JOIN measurement_frames AS m
               ON m.session_id = f.session_id AND m.sequence = f.sequence
@@ -1112,17 +1466,17 @@ class SQLiteMeasurementStore:
             """,
             (session_id,),
         ).fetchall()
-        resistance_rows = self._connection.execute(
+        word_rows = self._connection.execute(
             """
-            SELECT frame_sequence, raw_value FROM resistance_values
+            SELECT frame_sequence, raw_value FROM word_values
             WHERE session_id = ?
             ORDER BY frame_sequence, value_index
             """,
             (session_id,),
         ).fetchall()
-        resistance: dict[int, list[int]] = {}
-        for value in resistance_rows:
-            resistance.setdefault(value["frame_sequence"], []).append(value["raw_value"])
+        words: dict[int, list[int]] = {}
+        for value in word_rows:
+            words.setdefault(value["frame_sequence"], []).append(value["raw_value"])
 
         result: list[StoredFrame] = []
         for row in rows:
@@ -1137,10 +1491,10 @@ class SQLiteMeasurementStore:
                     weight_provenance=row["weight_provenance"],
                     b5=row["b5"],
                     b6=row["b6"],
-                    resistance_raw=tuple(resistance.get(row["sequence"], ())),
-                    resistance_layout=row["resistance_layout"],
-                    resistance_unit=row["resistance_unit"],
-                    resistance_provenance=row["resistance_provenance"],
+                    word_block=tuple(words.get(row["sequence"], ())),
+                    word_layout=row["word_layout"],
+                    word_provenance=row["word_provenance"],
+                    opaque_unit_evidence=row["opaque_unit_evidence"],
                 )
             result.append(
                 StoredFrame(
