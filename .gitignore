@@ -1,7 +1,6 @@
 *.iml
 .gradle/
 .idea/
-.pi/
 local.properties
 /build/
 **/build/
