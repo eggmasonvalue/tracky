@@ -28,6 +28,8 @@ from tracky_mcp.protocol import (
     QUALITY_VERSION,
     WEIGHT_SELECTION_POLICY_VERSION,
 )
+from tracky_mcp.protocol.burst import BurstAssembler
+from tracky_mcp.protocol.decode import MeasurementFrame, decode_frame
 from tracky_mcp.storage import (
     MeasurementSession,
     SessionStatus,
@@ -128,9 +130,33 @@ def _selected_weight(session: MeasurementSession) -> dict[str, Any] | None:
     }
 
 
-def extract_session_telemetry(session: MeasurementSession) -> dict[str, Any]:
-    """Project session metadata and only the persisted selected weight frame."""
+def _opaque_blocks(session: MeasurementSession) -> tuple[list[int] | None, list[int] | None]:
+    """Return only the latest pair assembled by the wire-valid burst rules."""
 
+    assembler = BurstAssembler()
+    for stored_frame in session.frames:
+        if stored_frame.direction != "rx":
+            continue
+        try:
+            decoded = decode_frame(stored_frame.raw)
+        except ValueError:
+            assembler.interrupt()
+            continue
+        if isinstance(decoded, MeasurementFrame):
+            assembler.add(decoded)
+        else:
+            assembler.interrupt()
+
+    if not assembler.completed:
+        return None, None
+    burst = assembler.completed[-1]
+    return list(burst.block_a), list(burst.block_b)
+
+
+def extract_session_telemetry(session: MeasurementSession) -> dict[str, Any]:
+    """Project session metadata, selected weight frame, and opaque burst blocks."""
+
+    block_a, block_b = _opaque_blocks(session)
     return {
         "contract_version": CONTRACT_VERSION,
         "session_id": session.id,
@@ -140,6 +166,8 @@ def extract_session_telemetry(session: MeasurementSession) -> dict[str, Any]:
         "quality_version": session.quality_version,
         "selection_policy_version": WEIGHT_SELECTION_POLICY_VERSION,
         "selected": _selected_weight(session),
+        "opaque_block_a": block_a,
+        "opaque_block_b": block_b,
         "device_alias": session.device_alias,
         "versions": _versions(session),
     }

@@ -92,6 +92,9 @@ object ObservationPageParser {
             )
         }
         val startedAt = parseInstant(requiredString(item, "started_at_utc"))
+        val opaqueBlockA = optionalIntList(item, "opaque_block_a")
+        val opaqueBlockB = optionalIntList(item, "opaque_block_b")
+        val impedances = optionalDoubleList(item, "impedances")
         return RemoteObservation(
             sessionId = requiredString(item, "session_id"),
             contractVersion = itemContractVersion,
@@ -103,6 +106,9 @@ object ObservationPageParser {
             selectionPolicyVersion = requiredInt(item, "selection_policy_version"),
             versions = itemVersions,
             weight = weight,
+            opaqueBlockA = opaqueBlockA,
+            opaqueBlockB = opaqueBlockB,
+            impedances = impedances,
         )
     }
 
@@ -182,6 +188,22 @@ object ObservationPageParser {
 
     private fun optionalString(value: JSONObject, key: String): String? =
         if (!value.has(key) || value.isNull(key)) null else requiredString(value, key)
+
+    private fun optionalIntList(value: JSONObject, key: String): List<Int>? {
+        if (!value.has(key) || value.isNull(key)) return null
+        val array = value.optJSONArray(key) ?: return null
+        return buildList(array.length()) {
+            for (i in 0 until array.length()) add(array.getInt(i))
+        }
+    }
+
+    private fun optionalDoubleList(value: JSONObject, key: String): List<Double>? {
+        if (!value.has(key) || value.isNull(key)) return null
+        val array = value.optJSONArray(key) ?: return null
+        return buildList(array.length()) {
+            for (i in 0 until array.length()) add(array.getDouble(i))
+        }
+    }
 
     private fun JSONObject.requiredObject(key: String): JSONObject = try {
         getJSONObject(key)

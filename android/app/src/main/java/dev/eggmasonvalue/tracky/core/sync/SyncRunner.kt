@@ -2,6 +2,8 @@ package dev.eggmasonvalue.tracky.core.sync
 
 import dev.eggmasonvalue.tracky.core.data.ImportDisposition
 import dev.eggmasonvalue.tracky.core.data.ImportLedger
+import dev.eggmasonvalue.tracky.core.derivation.DerivationInput
+import dev.eggmasonvalue.tracky.core.derivation.DerivationV1
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -10,6 +12,7 @@ import kotlinx.coroutines.CancellationException
 interface HealthConnectProjector {
     fun isAvailable(): Boolean
     suspend fun hasRequiredPermissions(): Boolean
+    suspend fun readLatestApplicableHeight(): HeightObservation?
     suspend fun insertWeight(projection: WeightProjection): String
 }
 
@@ -72,7 +75,26 @@ class SyncRunner(
                     quarantined++
                 }
                 is ObservationValidation.Valid -> {
-                    val projection = validation.projection
+                    var projection = validation.projection
+                    val impedances = validation.impedances
+                    if (impedances != null && projection.derivation == null) {
+                        val heightObs = runCatching { healthConnect.readLatestApplicableHeight() }.getOrNull()
+                        if (heightObs != null) {
+                            val derivation = DerivationV1.derive(
+                                DerivationInput(
+                                    heightCm = heightObs.heightCentimeters,
+                                    weightKg = projection.weightKg,
+                                    impedances = impedances,
+                                ),
+                            )
+                            if (derivation != null) {
+                                projection = projection.copy(
+                                    derivation = derivation,
+                                    derivationVersion = derivation.derivationVersion,
+                                )
+                            }
+                        }
+                    }
                     ledger.markPending(projection, clock.instant())
                     val healthConnectId = try {
                         healthConnect.insertWeight(projection)

@@ -58,6 +58,57 @@ class SyncRunnerTest {
         assertEquals("opaque-replay", ledger.savedCursor)
     }
 
+    @Test
+    fun `derivation is calculated and recorded when height and impedances are available`() = runTest {
+        val ledger = FakeLedger()
+        val health = FakeHealth(height = HeightObservation(now, 1.70))
+        val obsWithImpedances = valid("with-bia").copy(
+            impedances = listOf(
+                450.0, 460.0, 30.0, 420.0, 430.0,
+                380.0, 390.0, 25.0, 355.0, 365.0,
+            ),
+        )
+        val runner = runner(ledger, health, page(obsWithImpedances, nextCursor = "opaque-bia"))
+
+        val result = runner.run()
+        assertEquals(SyncRunResult.Success(1, 0, 0), result)
+        val written = health.writtenProjections.single()
+        assertEquals(1, written.derivationVersion)
+        val derivation = written.derivation
+        assertTrue(derivation != null)
+        assertEquals(1, derivation!!.derivationVersion)
+        assertEquals(38.3, derivation.bodyFatPct, 0.0) // 78.9 kg, 170 cm overweight bracket
+        assertEquals(48.7, derivation.leanBodyMassKg, 0.0)
+        assertEquals(1421, derivation.bmrKcal)
+
+        val entry = ledger.entries.getValue(written.clientRecordId)
+        assertEquals(ImportDisposition.IMPORTED, entry.disposition)
+        assertEquals(1, entry.derivationVersion)
+    }
+
+    @Test
+    fun `derivation is skipped when height is missing`() = runTest {
+        val ledger = FakeLedger()
+        val health = FakeHealth(height = null)
+        val obsWithImpedances = valid("no-height").copy(
+            impedances = listOf(
+                450.0, 460.0, 30.0, 420.0, 430.0,
+                380.0, 390.0, 25.0, 355.0, 365.0,
+            ),
+        )
+        val runner = runner(ledger, health, page(obsWithImpedances, nextCursor = "opaque-no-h"))
+
+        val result = runner.run()
+        assertEquals(SyncRunResult.Success(1, 0, 0), result)
+        val written = health.writtenProjections.single()
+        assertEquals(null, written.derivationVersion)
+        assertEquals(null, written.derivation)
+
+        val entry = ledger.entries.getValue(written.clientRecordId)
+        assertEquals(ImportDisposition.IMPORTED, entry.disposition)
+        assertEquals(null, entry.derivationVersion)
+    }
+
     private fun runner(
         ledger: FakeLedger,
         health: FakeHealth,
@@ -120,13 +171,19 @@ class SyncRunnerTest {
     )
 }
 
-private class FakeHealth(private val failWrites: Boolean = false) : HealthConnectProjector {
+private class FakeHealth(
+    private val failWrites: Boolean = false,
+    var height: HeightObservation? = null,
+) : HealthConnectProjector {
     var writeCount = 0
+    val writtenProjections = mutableListOf<WeightProjection>()
 
     override fun isAvailable(): Boolean = true
     override suspend fun hasRequiredPermissions(): Boolean = true
+    override suspend fun readLatestApplicableHeight(): HeightObservation? = height
     override suspend fun insertWeight(projection: WeightProjection): String {
         writeCount++
+        writtenProjections.add(projection)
         if (failWrites) error("test failure")
         return "hc-${projection.clientRecordId}"
     }

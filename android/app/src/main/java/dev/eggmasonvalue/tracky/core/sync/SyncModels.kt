@@ -1,5 +1,7 @@
 package dev.eggmasonvalue.tracky.core.sync
 
+import dev.eggmasonvalue.tracky.core.derivation.DerivationResult
+import dev.eggmasonvalue.tracky.core.derivation.DerivationV1
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.security.MessageDigest
@@ -11,6 +13,14 @@ const val SUPPORTED_DECODER_VERSION: Int = 2
 const val WEIGHT_PROJECTION_VERSION: Int = 1
 const val WEIGHT_SELECTION_POLICY_VERSION: Int = 1
 const val QUALITY_VERSION: Int = 1
+
+data class HeightObservation(
+    val recordedAt: Instant,
+    val heightMeters: Double,
+) {
+    val heightCentimeters: Double
+        get() = heightMeters * 100.0
+}
 
 data class ObservationVersions(
     val transportVersion: Int,
@@ -54,6 +64,9 @@ data class RemoteObservation(
     val selectionPolicyVersion: Int,
     val versions: ObservationVersions,
     val weight: SourceWeight?,
+    val opaqueBlockA: List<Int>? = null,
+    val opaqueBlockB: List<Int>? = null,
+    val impedances: List<Double>? = null,
 )
 
 data class ObservationPage(
@@ -74,10 +87,14 @@ data class WeightProjection(
     val weightKg: Double,
     val observedAt: Instant,
     val sourceQuality: String,
+    val derivation: DerivationResult? = null,
 )
 
 sealed interface ObservationValidation {
-    data class Valid(val projection: WeightProjection) : ObservationValidation
+    data class Valid(
+        val projection: WeightProjection,
+        val impedances: List<Double>? = null,
+    ) : ObservationValidation
     data class Invalid(
         val projection: WeightProjection,
         val errorCode: String,
@@ -141,13 +158,24 @@ object ObservationValidator {
         val observedAt = observation.startedAt
             ?: return invalid("missing_observed_at", "The source observation has no timestamp")
 
+        val impedances = observation.impedances
+            ?: if (observation.opaqueBlockA != null && observation.opaqueBlockB != null) {
+                DerivationV1.mapOpaqueBlocksToImpedances(
+                    observation.opaqueBlockA,
+                    observation.opaqueBlockB,
+                )
+            } else {
+                null
+            }
+
         return ObservationValidation.Valid(
-            projection.copy(
+            projection = projection.copy(
                 sourceSessionId = sessionId,
                 weightKg = kilograms,
                 observedAt = observedAt,
                 sourceQuality = observation.quality ?: "indeterminate",
             ),
+            impedances = impedances,
         )
     }
 
