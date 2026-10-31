@@ -1,12 +1,12 @@
 package dev.eggmasonvalue.tracky.core.sync
 
 import dev.eggmasonvalue.tracky.core.data.ImportDisposition
-import dev.eggmasonvalue.tracky.core.data.ImportLedger
-import dev.eggmasonvalue.tracky.core.data.ImportLedgerEntry
+import dev.eggmasonvalue.tracky.core.data.RoomImportLedger
+import dev.eggmasonvalue.tracky.core.data.SyncStateEntity
+import dev.eggmasonvalue.tracky.core.data.TestTrackyDao
 import java.time.Clock
-import java.time.Duration
-import java.time.Instant
 import java.time.ZoneOffset
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -14,265 +14,174 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SyncRunnerTest {
-    private val now = Instant.parse("2026-09-16T10:00:00Z")
-    private val clock = Clock.fixed(now, ZoneOffset.UTC)
+    private val dao = TestTrackyDao()
+    private val ledger = RoomImportLedger(dao)
+    private val health = FakeHealth()
+    private val fetchedCursors = mutableListOf<String?>()
 
     @Test
-    fun `cursor advances only after import or quarantine`() = runTest {
-        val ledger = FakeLedger()
-        val health = FakeHealth()
-        val runner = runner(ledger, health, page(valid("ok"), invalidMissingWeight("bad"), nextCursor = "opaque-2"))
-
-        val result = runner.run()
-
-        assertEquals(SyncRunResult.Success(imported = 1, alreadyTerminal = 0, quarantined = 1), result)
-        assertEquals("opaque-2", ledger.savedCursor)
-        assertEquals(ImportDisposition.IMPORTED, ledger.entries.getValue(ObservationValidator.clientRecordId("ok")).disposition)
-        assertEquals(ImportDisposition.QUARANTINED, ledger.entries.getValue(ObservationValidator.clientRecordId("bad")).disposition)
+    fun `cursor advances only after import or quarantine and stores every returned ID`() = runTest {
+        val runner = runner { page(testObservation("ok"), testObservation("bad").copy(weight = null)) }
+        assertEquals(SyncRunResult.Success(1, 0, 1), runner.run())
+        assertEquals("next-cursor", ledger.cursor())
+        val entry = ledger.find(ObservationValidator.clientRecordId("ok"))!!
+        assertEquals(ImportDisposition.IMPORTED, entry.disposition)
+        assertEquals(health.returnedIds, entry.healthConnectRecordIds)
+        assertEquals(2L, entry.derivationVersion)
+        assertEquals(ImportDisposition.QUARANTINED, ledger.find(ObservationValidator.clientRecordId("bad"))!!.disposition)
     }
 
     @Test
-    fun `cursor is not advanced when Health Connect write fails`() = runTest {
-        val ledger = FakeLedger()
-        val health = FakeHealth(failWrites = true)
-        val runner = runner(ledger, health, page(valid("retry"), nextCursor = "opaque-retry"))
-
+    fun `cursor is not advanced when a Health Connect operation fails`() = runTest {
+        health.failWrites = true
+        val runner = runner { page(testObservation("retry")) }
         assertEquals(SyncRunResult.Retry("health_connect_write_failed"), runner.run())
-        assertNull(ledger.savedCursor)
-        val entry = ledger.entries.getValue(ObservationValidator.clientRecordId("retry"))
+        assertNull(ledger.cursor())
+        val entry = ledger.find(ObservationValidator.clientRecordId("retry"))!!
         assertEquals(ImportDisposition.PENDING, entry.disposition)
         assertEquals("health_connect_write_failed", entry.lastErrorCode)
     }
 
     @Test
-    fun `replaying an imported pair is a no-op and can settle the cursor`() = runTest {
-        val ledger = FakeLedger()
-        val health = FakeHealth()
-        val observation = valid("replay")
-        val id = ObservationValidator.clientRecordId("replay")
-        ledger.entries[id] = importedEntry(observation, id)
-        val runner = runner(ledger, health, page(observation, nextCursor = "opaque-replay"))
+    fun `retry skips prior terminal items but retries pending item`() = runTest {
+        health.failOnId = ObservationValidator.clientRecordId("second")
+        val runner = runner { page(testObservation("first"), testObservation("second")) }
+        assertEquals(SyncRunResult.Retry("health_connect_write_failed"), runner.run())
+        assertNull(ledger.cursor())
+        health.failOnId = null
+        assertEquals(SyncRunResult.Success(1, 1, 0), runner.run())
+        assertEquals(3, health.written.size)
+        assertEquals("next-cursor", ledger.cursor())
+    }
 
+    @Test
+    fun `replay of same version is a no-op`() = runTest {
+        val runner = runner { page(testObservation("replay")) }
+        assertEquals(SyncRunResult.Success(1, 0, 0), runner.run())
         assertEquals(SyncRunResult.Success(0, 1, 0), runner.run())
-        assertEquals(0, health.writeCount)
-        assertEquals("opaque-replay", ledger.savedCursor)
+        assertEquals(1, health.written.size)
+        assertEquals(2L, ledger.derivationVersion())
     }
 
     @Test
-    fun `derivation is calculated and recorded when height and impedances are available`() = runTest {
-        val ledger = FakeLedger()
-        val health = FakeHealth(height = HeightObservation(now, 1.70))
-        val obsWithImpedances = valid("with-bia").copy(
-            impedances = listOf(
-                450.0, 460.0, 30.0, 420.0, 430.0,
-                380.0, 390.0, 25.0, 355.0, 365.0,
-            ),
-        )
-        val runner = runner(ledger, health, page(obsWithImpedances, nextCursor = "opaque-bia"))
-
-        val result = runner.run()
-        assertEquals(SyncRunResult.Success(1, 0, 0), result)
-        val written = health.writtenProjections.single()
-        assertEquals(1, written.derivationVersion)
-        val derivation = written.derivation
-        assertTrue(derivation != null)
-        assertEquals(1, derivation!!.derivationVersion)
-        assertEquals(38.3, derivation.bodyFatPct, 0.0) // 78.9 kg, 170 cm overweight bracket
-        assertEquals(48.7, derivation.leanBodyMassKg, 0.0)
-        assertEquals(1421, derivation.bmrKcal)
-
-        val entry = ledger.entries.getValue(written.clientRecordId)
-        assertEquals(ImportDisposition.IMPORTED, entry.disposition)
-        assertEquals(1, entry.derivationVersion)
+    fun `higher page version clears persisted cursor before refetch and reimports old entries`() = runTest {
+        val observation = testObservation("old").copy(composition = testComposition)
+        runner { page(observation) }.run()
+        health.written.clear()
+        fetchedCursors.clear()
+        val runner = runner { cursor ->
+            if (cursor != null) {
+                // Discovery page must be discarded, not imported before replaying from the start.
+                page(testObservation("discard", 3), version = 3)
+            } else {
+                assertEquals(3L, ledger.derivationVersion())
+                assertNull(ledger.cursor())
+                page(observation.copy(versions = testVersions(3), composition = null), version = 3)
+            }
+        }
+        assertEquals(SyncRunResult.Success(1, 0, 0), runner.run())
+        assertEquals(listOf("next-cursor", null), fetchedCursors)
+        assertEquals("old", health.written.single().sourceSessionId)
+        assertNull(health.written.single().composition)
+        assertEquals(3L, health.written.single().clientRecordVersion)
+        assertEquals(3L, ledger.find(ObservationValidator.clientRecordId("old"))!!.clientRecordVersion)
+        assertEquals(3L, ledger.derivationVersion())
     }
 
     @Test
-    fun `derivation is skipped when height is missing`() = runTest {
-        val ledger = FakeLedger()
-        val health = FakeHealth(height = null)
-        val obsWithImpedances = valid("no-height").copy(
-            impedances = listOf(
-                450.0, 460.0, 30.0, 420.0, 430.0,
-                380.0, 390.0, 25.0, 355.0, 365.0,
-            ),
-        )
-        val runner = runner(ledger, health, page(obsWithImpedances, nextCursor = "opaque-no-h"))
-
-        val result = runner.run()
-        assertEquals(SyncRunResult.Success(1, 0, 0), result)
-        val written = health.writtenProjections.single()
-        assertEquals(null, written.derivationVersion)
-        assertEquals(null, written.derivation)
-
-        val entry = ledger.entries.getValue(written.clientRecordId)
-        assertEquals(ImportDisposition.IMPORTED, entry.disposition)
-        assertEquals(null, entry.derivationVersion)
+    fun `empty discovery page triggers full replay on version bump`() = runTest {
+        dao.state = SyncStateEntity(cursor = "end", derivationVersion = 2)
+        val runner = runner { cursor ->
+            if (cursor == "end") page(version = 3, nextCursor = null)
+            else page(testObservation("historical", 3), version = 3)
+        }
+        assertEquals(SyncRunResult.Success(1, 0, 0), runner.run())
+        assertEquals(listOf("end", null), fetchedCursors)
     }
 
-    private fun runner(
-        ledger: FakeLedger,
-        health: FakeHealth,
-        page: ObservationPage,
-    ) = SyncRunner(
+    @Test
+    fun `version reset survives a failure fetching the replay page`() = runTest {
+        dao.state = SyncStateEntity(cursor = "end", derivationVersion = 2)
+        val runner = runner { cursor ->
+            if (cursor != null) page(version = 3, nextCursor = null)
+            else throw SyncTransportException(true, "offline", "test")
+        }
+        assertEquals(SyncRunResult.Retry("offline"), runner.run())
+        assertNull(ledger.cursor())
+        assertEquals(3L, ledger.derivationVersion())
+    }
+
+    @Test
+    fun `lower version cannot advance cursor or downgrade records`() = runTest {
+        dao.state = SyncStateEntity(cursor = "end", derivationVersion = 3)
+        assertEquals(SyncRunResult.Failure("derivation_version_regressed"), runner { page() }.run())
+        assertEquals("end", ledger.cursor())
+        assertTrue(health.written.isEmpty())
+    }
+
+    @Test
+    fun `Linux composition is forwarded without derivation and null is forwarded for deletion`() = runTest {
+        val runner = runner {
+            page(testObservation("derived").copy(composition = testComposition), testObservation("weight-only"))
+        }
+        assertEquals(SyncRunResult.Success(2, 0, 0), runner.run())
+        assertEquals(testComposition, health.written[0].composition)
+        assertNull(health.written[1].composition)
+    }
+
+    @Test
+    fun `weight permission is the only runner permission prerequisite`() = runTest {
+        health.authorized = false
+        assertEquals(SyncRunResult.HealthConnectPermissionsMissing, runner { page() }.run())
+        assertTrue(fetchedCursors.isEmpty())
+        health.authorized = true
+        assertEquals(SyncRunResult.Success(1, 0, 0), runner { page(testObservation()) }.run())
+    }
+
+    @Test
+    fun `cancellation leaves item pending and cursor unchanged`() = runTest {
+        health.cancelWrites = true
+        try {
+            runner { page(testObservation()) }.run()
+            error("Expected cancellation")
+        } catch (_: CancellationException) {
+            assertNull(ledger.cursor())
+            assertEquals(ImportDisposition.PENDING, ledger.find(ObservationValidator.clientRecordId("session-1"))!!.disposition)
+        }
+    }
+
+    private fun runner(fetch: suspend (String?) -> ObservationPage) = SyncRunner(
         configSource = object : SyncConfigSource {
             override fun load() = SyncEndpointValidator.validate("https://appliance.example", "test-token")
         },
         ledger = ledger,
         transport = object : ObservationTransport {
             override suspend fun fetch(config: SyncEndpointConfig, cursor: String?): ObservationPage {
-                assertEquals(null, cursor)
-                return page
+                fetchedCursors.add(cursor)
+                return fetch(cursor)
             }
         },
         healthConnect = health,
-        clock = clock,
+        clock = Clock.fixed(testInstant, ZoneOffset.UTC),
     )
 
-    private fun page(
-        vararg observations: RemoteObservation,
-        nextCursor: String?,
-    ) = ObservationPage(
-        observations = observations.toList(),
-        nextCursor = nextCursor,
-        versions = ObservationVersions(1, 2, listOf(2), 1, 1),
-        sourceState = PageSourceState("ready", null),
-    )
-
-    private fun valid(id: String) = RemoteObservation(
-        sessionId = id,
-        contractVersion = 1,
-        status = "complete",
-        quality = "accepted",
-        qualityVersion = 1,
-        startedAt = now,
-        selectedFrameSequence = 3,
-        selectionPolicyVersion = 1,
-        versions = ObservationVersions(1, 2, listOf(2), 1, 1),
-        weight = SourceWeight(7890, 100, "kg", "Linux source"),
-    )
-
-    private fun invalidMissingWeight(id: String) = valid(id).copy(weight = null)
-
-    private fun importedEntry(observation: RemoteObservation, id: String) = ImportLedgerEntry(
-        clientRecordId = id,
-        sourceSessionId = observation.sessionId!!,
-        clientRecordVersion = 1,
-        contractVersion = 1,
-        selectionPolicyVersion = 1,
-        derivationVersion = null,
-        disposition = ImportDisposition.IMPORTED,
-        healthConnectRecordId = "hc-id",
-        attemptCount = 1,
-        lastAttemptAt = now,
-        nextRetryAt = null,
-        lastErrorCode = null,
-        lastErrorMessage = null,
-        updatedAt = now,
-    )
+    private fun page(vararg observations: RemoteObservation, version: Long = 2, nextCursor: String? = "next-cursor") =
+        ObservationPage(observations.toList(), nextCursor, testVersions(version), PageSourceState("ready", null))
 }
 
-private class FakeHealth(
-    private val failWrites: Boolean = false,
-    var height: HeightObservation? = null,
-) : HealthConnectProjector {
-    var writeCount = 0
-    val writtenProjections = mutableListOf<WeightProjection>()
-
-    override fun isAvailable(): Boolean = true
-    override suspend fun hasRequiredPermissions(): Boolean = true
-    override suspend fun readLatestApplicableHeight(): HeightObservation? = height
-    override suspend fun insertWeight(projection: WeightProjection): String {
-        writeCount++
-        writtenProjections.add(projection)
-        if (failWrites) error("test failure")
-        return "hc-${projection.clientRecordId}"
+private class FakeHealth : HealthConnectProjector {
+    var failWrites = false
+    var failOnId: String? = null
+    var cancelWrites = false
+    var authorized = true
+    val returnedIds = listOf("hc-weight", "hc-fat", "hc-lean", "hc-water", "hc-bone", "hc-bmr")
+    val written = mutableListOf<SessionProjection>()
+    override fun isAvailable() = true
+    override suspend fun hasRequiredPermissions() = authorized
+    override suspend fun writeSession(projection: SessionProjection): List<String> {
+        written.add(projection)
+        if (cancelWrites) throw CancellationException("test")
+        if (failWrites || projection.clientRecordId == failOnId) error("test failure")
+        return returnedIds
     }
-}
-
-private class FakeLedger : ImportLedger {
-    val entries = linkedMapOf<String, ImportLedgerEntry>()
-    var savedCursor: String? = null
-        private set
-
-    override suspend fun find(clientRecordId: String): ImportLedgerEntry? = entries[clientRecordId]
-
-    override suspend fun markPending(projection: WeightProjection, now: Instant) {
-        val old = entries[projection.clientRecordId]
-        entries[projection.clientRecordId] = ImportLedgerEntry(
-            clientRecordId = projection.clientRecordId,
-            sourceSessionId = projection.sourceSessionId,
-            clientRecordVersion = projection.clientRecordVersion,
-            contractVersion = projection.contractVersion,
-            selectionPolicyVersion = projection.selectionPolicyVersion,
-            derivationVersion = projection.derivationVersion,
-            disposition = ImportDisposition.PENDING,
-            healthConnectRecordId = null,
-            attemptCount = old?.attemptCount ?: 0,
-            lastAttemptAt = old?.lastAttemptAt,
-            nextRetryAt = null,
-            lastErrorCode = null,
-            lastErrorMessage = null,
-            updatedAt = now,
-        )
-    }
-
-    override suspend fun markImported(clientRecordId: String, healthConnectRecordId: String, now: Instant) {
-        val old = entries.getValue(clientRecordId)
-        entries[clientRecordId] = old.copy(
-            disposition = ImportDisposition.IMPORTED,
-            healthConnectRecordId = healthConnectRecordId,
-            attemptCount = old.attemptCount + 1,
-            lastAttemptAt = now,
-            nextRetryAt = null,
-            lastErrorCode = null,
-            lastErrorMessage = null,
-            updatedAt = now,
-        )
-    }
-
-    override suspend fun markAttemptFailed(
-        clientRecordId: String,
-        now: Instant,
-        errorCode: String,
-        errorMessage: String,
-        retryAfter: Duration,
-    ) {
-        val old = entries.getValue(clientRecordId)
-        entries[clientRecordId] = old.copy(
-            disposition = ImportDisposition.PENDING,
-            attemptCount = old.attemptCount + 1,
-            lastAttemptAt = now,
-            nextRetryAt = now.plus(retryAfter),
-            lastErrorCode = errorCode,
-            lastErrorMessage = errorMessage,
-            updatedAt = now,
-        )
-    }
-
-    override suspend fun markQuarantined(
-        projection: WeightProjection,
-        now: Instant,
-        errorCode: String,
-        errorMessage: String,
-    ) {
-        entries[projection.clientRecordId] = ImportLedgerEntry(
-            clientRecordId = projection.clientRecordId,
-            sourceSessionId = projection.sourceSessionId,
-            clientRecordVersion = projection.clientRecordVersion,
-            contractVersion = projection.contractVersion,
-            selectionPolicyVersion = projection.selectionPolicyVersion,
-            derivationVersion = projection.derivationVersion,
-            disposition = ImportDisposition.QUARANTINED,
-            healthConnectRecordId = null,
-            attemptCount = 0,
-            lastAttemptAt = now,
-            nextRetryAt = null,
-            lastErrorCode = errorCode,
-            lastErrorMessage = errorMessage,
-            updatedAt = now,
-        )
-    }
-
-    override suspend fun cursor(): String? = savedCursor
-    override suspend fun advanceCursor(cursor: String?) { savedCursor = cursor }
 }

@@ -218,6 +218,60 @@ def test_backend_disconnect_closes_active_event_stream(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("stage", ["stop_notify", "writes", "disconnect", "connect_failure"])
+def test_teardown_has_a_hard_deadline_even_when_backend_cleanup_stalls(stage: str) -> None:
+    async def scenario() -> None:
+        release = asyncio.Event()
+
+        async def stall() -> None:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+
+        class StalledClient(FakeClient):
+            async def connect(self) -> None:
+                if stage == "connect_failure":
+                    raise RuntimeError("connect failed")
+                await super().connect()
+
+            async def stop_notify(self, uuid: str) -> None:
+                if stage == "stop_notify":
+                    await stall()
+                await super().stop_notify(uuid)
+
+            async def write_gatt_char(self, uuid: str, data: bytes) -> None:
+                if stage == "writes":
+                    await stall()
+                await super().write_gatt_char(uuid, data)
+
+            async def disconnect(self) -> None:
+                if stage in {"disconnect", "connect_failure"}:
+                    await stall()
+                await super().disconnect()
+
+        fake = StalledClient()
+        client = ScaleClient("fixture-target", client=fake, cleanup_timeout_seconds=0.01)
+        try:
+            if stage == "connect_failure":
+                with pytest.raises(RuntimeError, match="connect failed"):
+                    await asyncio.wait_for(client.connect(), 0.5)
+            else:
+                await client.connect()
+                if stage == "writes":
+                    await fake.notify(INFO)
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(client.disconnect(), 0.5)
+            assert not client.is_connected
+        finally:
+            release.set()
+            await asyncio.sleep(0.03)
+        assert not client._pending_tasks
+
+    asyncio.run(scenario())
+
+
 def test_disconnect_ignores_benign_stop_notify_race() -> None:
     class FlakyNotifyClient(FakeClient):
         async def stop_notify(self, uuid: str) -> None:

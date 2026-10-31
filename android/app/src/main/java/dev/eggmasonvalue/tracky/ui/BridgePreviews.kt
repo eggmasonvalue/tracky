@@ -24,7 +24,8 @@ private fun BridgeConfiguredPreview() {
             state = BridgeUiState(
                 healthConnectAvailable = true,
                 healthConnectAuthorized = true,
-                latestHeightCm = 178.0,
+                compositionPermissionsGranted = 5,
+                localNetworkAuthorized = true,
                 configured = true,
                 endpoint = "https://appliance.example",
                 diagnosticsStatus = "success",

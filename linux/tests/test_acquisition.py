@@ -8,6 +8,8 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from tracky_mcp.acquisition import AcquisitionService, WeighInRequest
 from tracky_mcp.ble import FFF1_NOTIFY_UUID, FFF2_WRITE_UUID, WireEvent, WireObserver
 from tracky_mcp.protocol import (
@@ -187,6 +189,19 @@ def test_cancel_aborts_session_but_retains_wire_evidence(tmp_path: Path) -> None
     asyncio.run(scenario())
 
 
+def test_cancellation_before_first_task_turn_closes_pending_operation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        with SQLiteMeasurementStore(tmp_path / "early-cancel.sqlite3") as store:
+            service = AcquisitionService(store, clock=FixedClock())
+            operation_id = service.start(WeighInRequest(device=object()))
+            operation = await service.cancel(operation_id)
+            assert operation.status is OperationStatus.CANCELLED
+            assert operation.session_id is None
+            assert store.list_sessions() == []
+
+    asyncio.run(scenario())
+
+
 def test_transport_failure_is_persisted_instead_of_escaping_background_task(
     tmp_path: Path,
 ) -> None:
@@ -238,15 +253,82 @@ def test_startup_recovery_fails_orphaned_handles_and_aborts_open_sessions(
         operation_id = store.create_operation(created_at=NOW)
         session_id = store.create_session(started_at=NOW)
         store.start_operation(operation_id, session_id=session_id, started_at=NOW)
+        orphan_id = store.create_session(started_at=NOW)
+        store.append_frame(orphan_id, INFO)
+        complete_id = store.create_session(started_at=NOW)
+        store.complete_session(complete_id, ended_at=NOW)
 
     with SQLiteMeasurementStore(path) as reopened:
         AcquisitionService(reopened, clock=FixedClock())
         operation = reopened.get_operation(operation_id)
         session = reopened.get_session(session_id)
+        orphan = reopened.get_session(orphan_id)
+        assert reopened.get_session(complete_id).status is SessionStatus.COMPLETE
+        assert reopened.recover_interrupted_operations(recovered_at=NOW) == []
 
+    assert orphan.status is SessionStatus.ABORTED
+    assert orphan.quality_reason == "process_restarted"
+    assert len(orphan.frames) == 1
     assert operation.status is OperationStatus.FAILED
     assert operation.error_code == "process_restarted"
     assert session.status is SessionStatus.ABORTED
+
+
+@pytest.mark.parametrize("cancel", [True, False])
+def test_stop_and_cancel_have_hard_deadlines_for_iterator_and_disconnect(
+    tmp_path: Path, cancel: bool,
+) -> None:
+    async def scenario() -> None:
+        release = asyncio.Event()
+        client: BlockingWireClient | None = None
+
+        class StalledClient(BlockingWireClient):
+            async def events(self) -> AsyncIterator[DecodedFrame]:
+                try:
+                    async for event in super().events():
+                        yield event
+                finally:
+                    # Deliberately suppress cancellation, as a stuck backend can.
+                    while not release.is_set():
+                        try:
+                            await release.wait()
+                        except asyncio.CancelledError:
+                            pass
+                    self.observer(WireEvent(NOW, "rx", FFF1_NOTIFY_UUID, INFO))
+
+            async def disconnect(self) -> None:
+                await release.wait()
+
+        def factory(_request: WeighInRequest, observer: WireObserver) -> BlockingWireClient:
+            nonlocal client
+            client = StalledClient(observer)
+            return client
+
+        with SQLiteMeasurementStore(tmp_path / "cleanup.sqlite3") as store:
+            service = AcquisitionService(
+                store, client_factory=factory, clock=FixedClock(), cleanup_timeout_seconds=0.01
+            )
+            operation_id = service.start(WeighInRequest(device=object()))
+            try:
+                while client is None:
+                    await asyncio.sleep(0)
+                await client.ready.wait()
+                finish = service.cancel if cancel else service.stop
+                operation = await asyncio.wait_for(finish(operation_id), 0.5)
+                assert operation.status is (
+                    OperationStatus.CANCELLED if cancel else OperationStatus.COMPLETE
+                )
+                assert service.get_session(operation_id).status is (
+                    SessionStatus.ABORTED if cancel else SessionStatus.COMPLETE
+                )
+                await asyncio.sleep(0)
+                assert not service._tasks  # The daemon's active-operation wait can finish.
+            finally:
+                release.set()
+                await asyncio.sleep(0.03)
+            assert len(service.get_session(operation_id).frames) == 3  # Late RX ignored.
+
+    asyncio.run(scenario())
 
 
 def test_operation_handle_survives_store_reopen(tmp_path: Path) -> None:

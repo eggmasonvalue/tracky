@@ -1,207 +1,150 @@
 package dev.eggmasonvalue.tracky.core.sync
 
-import java.time.Instant
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ObservationContractTest {
     @Test
-    fun `parser keeps only Linux selected weight and opaque cursor`() {
-        val page = ObservationPageParser.parse(
-            envelope(
-                nextCursor = "opaque-page-cursor",
-                session = """
-                    {
-                      "contract_version": 1,
-                      "session_id": "session-1",
-                      "status": "complete",
-                      "quality": "accepted",
-                      "quality_version": 1,
-                      "selection_policy_version": 1,
-                      "started_at_utc": "2026-09-16T10:00:00Z",
-                      "selected": {
-                        "frame_sequence": 3,
-                        "weight": {
-                          "raw": 7890,
-                          "divisor": 100,
-                          "unit": "kg",
-                          "provenance": "Linux decoder v1"
-                        }
-                      },
-                      "versions": ${versions()}
-                    }
-                """.trimIndent(),
-            ),
-        )
-
-        assertEquals("opaque-page-cursor", page.nextCursor)
+    fun `v2 parses Linux composition and ignores unknown fields and electrical evidence`() {
+        val page = ObservationPageParser.parse(envelope(session(composition = composition())))
+        assertEquals("opaque-cursor", page.nextCursor)
+        assertEquals(2L, page.versions.derivationVersion)
         val source = page.observations.single()
-        assertEquals("session-1", source.sessionId)
-        assertEquals(3L, source.selectedFrameSequence)
         assertEquals(7890L, source.weight?.raw)
-        assertEquals(100L, source.weight?.divisor)
-        assertEquals("kg", source.weight?.unit)
-        assertEquals(null, source.weight?.let { it.copy(raw = null).kilogramsOrNull() })
-        assertTrue(ObservationValidator.validate(source) is ObservationValidation.Valid)
+        assertEquals(testComposition, source.composition)
+        val validated = ObservationValidator.validate(source) as ObservationValidation.Valid
+        assertEquals(testComposition, validated.projection.composition)
+        assertEquals(78.9, validated.projection.weightKg, 0.0)
     }
 
     @Test
-    fun `missing selected source weight is permanently quarantinable`() {
-        val page = ObservationPageParser.parse(
-            envelope(
-                session = """
-                    {
-                      "contract_version": 1,
-                      "session_id": "session-2",
-                      "status": "complete",
-                      "quality": "indeterminate",
-                      "quality_version": 1,
-                      "selection_policy_version": 1,
-                      "started_at_utc": "2026-09-16T10:00:00Z",
-                      "selected": null,
-                      "weight_kg": 78.9,
-                      "body_fat_percentage": 21.5,
-                      "versions": ${versions()}
-                    }
-                """.trimIndent(),
-            ),
-        )
-
-        val validation = ObservationValidator.validate(page.observations.single())
-        assertTrue(validation is ObservationValidation.Invalid)
-        assertEquals("no_safe_selection", (validation as ObservationValidation.Invalid).errorCode)
-        assertFalse(page.observations.single().weight?.kilogramsOrNull() == 78.9)
+    fun `explicit null composition is weight-only`() {
+        val page = ObservationPageParser.parse(envelope(session()))
+        assertNull(page.observations.single().composition)
+        val result = ObservationValidator.validate(page.observations.single()) as ObservationValidation.Valid
+        assertNull(result.projection.composition)
+        assertEquals(2L, result.projection.clientRecordVersion)
     }
 
     @Test
-    fun `future or malformed page versions fail before item quarantine`() {
-        val future = envelope(versions = versions(decoderVersion = 3))
+    fun `empty page still carries derivation version`() {
+        val page = ObservationPageParser.parse(envelope(version = 3))
+        assertTrue(page.observations.isEmpty())
+        assertEquals(3L, page.versions.derivationVersion)
+    }
+
+    @Test
+    fun `derivation version is an exact positive Long not a truncated Int`() {
+        val version = 2147483648L
+        val page = ObservationPageParser.parse(envelope(session(composition(version), version), version))
+        val validated = ObservationValidator.validate(page.observations.single()) as ObservationValidation.Valid
+        assertEquals(version, page.versions.derivationVersion)
+        assertEquals(version, validated.projection.clientRecordVersion)
+        for (invalid in listOf("0", "-1", "2.5", "9223372036854775808")) {
+            val body = envelope().replace("\"derivation_version\":2", "\"derivation_version\":$invalid")
+            assertThrows(ObservationContractException::class.java) { ObservationPageParser.parse(body) }
+        }
+    }
+
+    @Test
+    fun `only v2 pages and sessions are accepted`() {
+        val page = JSONObject(envelope(session())).put("contract_version", 1)
+        assertThrows(ObservationContractException::class.java) { ObservationPageParser.parse(page.toString()) }
+        val item = JSONObject(session()).put("contract_version", 1)
+        assertThrows(ObservationContractException::class.java) { ObservationPageParser.parse(envelope(item.toString())) }
+    }
+
+    @Test
+    fun `composition is required and versions must match page`() {
+        val missing = JSONObject(session()).also { it.remove("composition") }
+        assertThrows(ObservationContractException::class.java) { ObservationPageParser.parse(envelope(missing.toString())) }
         assertThrows(ObservationContractException::class.java) {
-            ObservationPageParser.parse(future)
+            ObservationPageParser.parse(envelope(session(composition(version = 3))))
         }
-
-        val malformed = envelope(versions = "{\"transport_version\":1}")
         assertThrows(ObservationContractException::class.java) {
-            ObservationPageParser.parse(malformed)
+            ObservationPageParser.parse(envelope(session(version = 3)))
         }
+        val noVersion = JSONObject(versions()).also { it.remove("derivation_version") }
+        val root = JSONObject(envelope()).put("versions", noVersion)
+        assertThrows(ObservationContractException::class.java) { ObservationPageParser.parse(root.toString()) }
     }
 
     @Test
-    fun `retryable source state cannot carry a cursor`() {
-        val page = envelope(
-            sourceState = "{\"kind\":\"retryable\",\"code\":\"source_session_open\"}",
-            nextCursor = null,
-        )
-        val parsed = ObservationPageParser.parse(page)
-        assertEquals("retryable", parsed.sourceState.kind)
-        assertEquals("source_session_open", parsed.sourceState.code)
-        assertEquals(null, parsed.nextCursor)
+    fun `unsupported decoder or malformed versions fail before quarantine`() {
+        val root = JSONObject(envelope()).put("versions", JSONObject("{\"transport_version\":1}"))
+        assertThrows(ObservationContractException::class.java) { ObservationPageParser.parse(root.toString()) }
+        val decoder = JSONObject(versions()).put("decoder_versions", org.json.JSONArray("[3]"))
+        root.put("versions", decoder)
+        assertThrows(ObservationContractException::class.java) { ObservationPageParser.parse(root.toString()) }
     }
 
     @Test
-    fun `source weight uses declared divisor without clamping`() {
-        val source = RemoteObservation(
-            sessionId = "session-3",
-            contractVersion = 1,
-            status = "complete",
-            quality = "indeterminate",
-            qualityVersion = 1,
-            startedAt = Instant.parse("2026-09-16T10:00:00Z"),
-            selectedFrameSequence = 2,
-            selectionPolicyVersion = 1,
-            versions = supportedVersions(),
-            weight = SourceWeight(7890, 100, "kg", "source"),
-        )
-
-        val validation = ObservationValidator.validate(source) as ObservationValidation.Valid
-        assertEquals(78.9, validation.projection.weightKg, 0.0)
-        assertEquals(1L, validation.projection.clientRecordVersion)
-        assertEquals(1, validation.projection.selectionPolicyVersion)
-        assertEquals(null, validation.projection.derivationVersion)
-        assertTrue(validation.projection.clientRecordId.startsWith("tracky-linux-weight-v1-"))
+    fun `missing source-selected weight is quarantinable and unknown fallback is ignored`() {
+        val item = JSONObject(session()).put("selected", JSONObject.NULL).put("weight_kg", 78.9)
+        val observation = ObservationPageParser.parse(envelope(item.toString())).observations.single()
+        val result = ObservationValidator.validate(observation) as ObservationValidation.Invalid
+        assertEquals("no_safe_selection", result.errorCode)
+        assertNull(observation.weight)
     }
 
     @Test
-    fun `opaque blocks a and b are mapped to canonical 10-channel impedances`() {
-        // Block A (packet 0x21): LF20, LF100, RF20, RF100, LH20
-        // Block B (packet 0x22): LH100, RH20, RH100, T20, T100
-        val page = ObservationPageParser.parse(
-            envelope(
-                session = """
-                    {
-                      "contract_version": 1,
-                      "session_id": "session-burst",
-                      "status": "complete",
-                      "quality": "accepted",
-                      "quality_version": 1,
-                      "selection_policy_version": 1,
-                      "started_at_utc": "2026-09-16T10:00:00Z",
-                      "selected": {
-                        "frame_sequence": 3,
-                        "weight": {
-                          "raw": 7000,
-                          "divisor": 100,
-                          "unit": "kg",
-                          "provenance": "Linux decoder v1"
-                        }
-                      },
-                      "opaque_block_a": [4300, 3650, 4200, 3550, 4600],
-                      "opaque_block_b": [3900, 4500, 3800, 300, 250],
-                      "versions": ${versions()}
-                    }
-                """.trimIndent(),
-            ),
-        )
-        val source = page.observations.single()
-        assertEquals(listOf(4300, 3650, 4200, 3550, 4600), source.opaqueBlockA)
-        assertEquals(listOf(3900, 4500, 3800, 300, 250), source.opaqueBlockB)
-
-        val validation = ObservationValidator.validate(source) as ObservationValidation.Valid
-        val impedances = validation.impedances
-        assertTrue(impedances != null)
-        assertEquals(10, impedances!!.size)
-        // Canonical order: RH20, LH20, T20, RF20, LF20, RH100, LH100, T100, RF100, LF100
-        assertEquals(450.0, impedances[0], 0.0) // RH20 = B[1] * 0.1
-        assertEquals(460.0, impedances[1], 0.0) // LH20 = A[4] * 0.1
-        assertEquals(30.0, impedances[2], 0.0)  // T20 = B[3] * 0.1
-        assertEquals(420.0, impedances[3], 0.0) // RF20 = A[2] * 0.1
-        assertEquals(430.0, impedances[4], 0.0) // LF20 = A[0] * 0.1
-        assertEquals(380.0, impedances[5], 0.0) // RH100 = B[2] * 0.1
-        assertEquals(390.0, impedances[6], 0.0) // LH100 = B[0] * 0.1
-        assertEquals(25.0, impedances[7], 0.0)  // T100 = B[4] * 0.1
-        assertEquals(355.0, impedances[8], 0.0) // RF100 = A[3] * 0.1
-        assertEquals(365.0, impedances[9], 0.0) // LF100 = A[1] * 0.1
+    fun `source weight validation remains unchanged and does not clamp`() {
+        fun validate(weight: SourceWeight) = ObservationValidator.validate(testObservation().copy(weight = weight))
+        val result = validate(SourceWeight(7890, 100, "kg", "source")) as ObservationValidation.Valid
+        assertEquals(78.9, result.projection.weightKg, 0.0)
+        assertNull(SourceWeight(1, 0, "kg", "source").kilogramsOrNull())
+        assertEquals("weight_out_of_range", (validate(SourceWeight(100001, 100, "kg", "source")) as ObservationValidation.Invalid).errorCode)
+        assertEquals("invalid_weight", (validate(SourceWeight(-1, 100, "kg", "source")) as ObservationValidation.Invalid).errorCode)
+        assertEquals("unsupported_weight_unit", (validate(SourceWeight(7890, 100, "lb", "source")) as ObservationValidation.Invalid).errorCode)
     }
 
-    private fun envelope(
-        session: String? = null,
-        nextCursor: String? = "cursor",
-        versions: String = versions(),
-        sourceState: String = "{\"kind\":\"ready\"}",
-    ): String = """
-        {
-          "ok": true,
-          "contract_version": 1,
-          "versions": $versions,
-          "source_state": $sourceState,
-          "count": ${if (session == null) 0 else 1},
-          "next_cursor": ${nextCursor?.let { "\"$it\"" } ?: "null"},
-          "sessions": [${session ?: ""}]
+    @Test
+    fun `retryable source state cannot advance a cursor`() {
+        val root = JSONObject(envelope()).put("source_state", JSONObject("{\"kind\":\"retryable\",\"code\":\"source_session_open\"}"))
+        assertThrows(ObservationContractException::class.java) { ObservationPageParser.parse(root.toString()) }
+        root.put("next_cursor", JSONObject.NULL)
+        assertEquals("source_session_open", ObservationPageParser.parse(root.toString()).sourceState.code)
+    }
+
+    @Test
+    fun `identity is a stable SHA256 prefix with record-specific suffixes independent of version`() {
+        val expectedBase = "tracky-ba7816bf8f01cfea414140de5dae2223"
+        assertEquals("$expectedBase-weight", ObservationValidator.clientRecordId("abc"))
+        val projection = (ObservationValidator.validate(testObservation("abc")) as ObservationValidation.Valid).projection
+        listOf("weight", "body-fat", "lean-body-mass", "body-water-mass", "bone-mass", "bmr").forEach {
+            assertEquals("$expectedBase-$it", projection.clientRecordIdFor(it))
         }
+        val bumped = ObservationValidator.validate(testObservation("abc", 3)) as ObservationValidation.Valid
+        assertEquals(projection.clientRecordId, bumped.projection.clientRecordId)
+        assertEquals(3L, bumped.projection.clientRecordVersion)
+    }
+
+    private fun envelope(item: String? = null, version: Long = 2): String = """
+        {"ok":true,"contract_version":2,"versions":${versions(version)},
+         "source_state":{"kind":"ready"},"count":${if (item == null) 0 else 1},
+         "next_cursor":"opaque-cursor","sessions":[${item ?: ""}],"future_page_field":{}}
     """.trimIndent()
 
-    private fun versions(decoderVersion: Int = 2): String = """
-        {
-          "transport_version": 1,
-          "decoder_version": $decoderVersion,
-          "decoder_versions": [$decoderVersion],
-          "selection_policy_version": 1,
-          "quality_version": 1
-        }
+    private fun session(composition: String = "null", version: Long = 2): String = """
+        {"contract_version":2,"session_id":"session-1","status":"complete","quality":"accepted",
+         "quality_version":1,"selection_policy_version":1,"started_at_utc":"2026-09-16T10:00:00Z",
+         "selected":{"frame_sequence":3,"weight":{"raw":7890,"divisor":100,"unit":"kg","provenance":"Linux source"}},
+         "versions":${versions(version)},"composition":$composition,"composition_unavailable":${if (composition == "null") "\"no_impedance\"" else "null"},
+         "opaque_block_a":{"unknown_evidence":true},"opaque_block_b":[1,2],"impedances":"not for Android","future_session_field":true}
     """.trimIndent()
 
-    private fun supportedVersions() = ObservationVersions(1, 2, listOf(2), 1, 1)
+    private fun composition(version: Long = 2): String = """
+        {"derivation_version":$version,"trunk_order":"wire","height_cm":170.0,
+         "body_fat_pct":24.4,"lean_body_mass_kg":57.8,"body_water_kg":42.1,"bone_mass_kg":3.41,
+         "protein_kg":12.08,"skeletal_muscle_kg":31.65,"basal_metabolic_rate_kcal_per_day":1618,"future_metric":123}
+    """.trimIndent()
+
+    private fun versions(version: Long = 2): String = """
+        {"transport_version":1,"decoder_version":2,"decoder_versions":[2],
+         "selection_policy_version":1,"quality_version":1,"derivation_version":$version}
+    """.trimIndent()
 }

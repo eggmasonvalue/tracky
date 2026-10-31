@@ -17,6 +17,7 @@ from typing import Any
 
 from tracky_mcp.acquisition.service import AcquisitionService, WeighInRequest
 from tracky_mcp.ble import ScaleClient, is_scale_device
+from tracky_mcp.ble.cleanup import CLEANUP_TIMEOUT_SECONDS, bounded_await
 from tracky_mcp.storage import SQLiteMeasurementStore
 
 logger = logging.getLogger("tracky.daemon")
@@ -40,13 +41,20 @@ class TrackyDaemon:
         cooldown_seconds: float = 10.0,
         acquisition_timeout_seconds: float = 45.0,
         adapter: str | None = None,
+        scanner_health_interval_seconds: float = 30.0,
     ) -> None:
         self.store = store or SQLiteMeasurementStore()
         self._scanner_factory = scanner_factory
         self._client_factory = client_factory
         self.cooldown_seconds = cooldown_seconds
         self.acquisition_timeout_seconds = acquisition_timeout_seconds
-        self.adapter = adapter
+        # Select explicitly so discovery and the health probe use the same adapter.
+        self.adapter = adapter or "hci0"
+        if scanner_health_interval_seconds <= 0:
+            raise ValueError("scanner_health_interval_seconds must be greater than zero")
+        self._scanner_health_interval_seconds = scanner_health_interval_seconds
+        self._health_bus: Any = None
+        self._bluez_owner: str | None = None
 
         self.service = AcquisitionService(
             store=self.store,
@@ -81,9 +89,8 @@ class TrackyDaemon:
         kwargs: dict[str, Any] = {
             "detection_callback": self._on_detection,
             "scanning_mode": "active",
+            "adapter": self.adapter,
         }
-        if self.adapter:
-            kwargs["adapter"] = self.adapter
         return BleakScanner(**kwargs)
 
     def _on_detection(self, device: Any, advertisement_data: Any) -> None:
@@ -107,6 +114,8 @@ class TrackyDaemon:
         name: str,
     ) -> None:
         async with self._lock:
+            if not self._running:
+                return
             if self._active_operation_id is not None:
                 logger.debug("Scale seen but acquisition already active; ignoring")
                 return
@@ -172,8 +181,54 @@ class TrackyDaemon:
         logger.info("Starting Tracky 24/7 background acquisition daemon...")
         self._running = True
         self._scanner = self._create_scanner()
-        await self._scanner.start()
+        await bounded_await(self._scanner.start())
         logger.info("Scanner active. Waiting for QN-Scale weigh-ins.")
+
+    async def _check_scanner_health(self) -> None:
+        """Probe live BlueZ state, not advertisement silence or cached properties.
+
+        The dedicated D-Bus connection also detects a system-bus disconnect.
+        A changed BlueZ owner means the scanner's original discovery session
+        was lost, even if another client has since enabled discovery again.
+        dbus-fast is already a dependency of Bleak's Linux backend.
+        """
+
+        from dbus_fast import BusType, Message, MessageType
+        from dbus_fast.aio import MessageBus
+
+        if self._health_bus is None:
+            self._health_bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        bus = self._health_bus
+        if not bus.connected:
+            raise RuntimeError("Scanner health failed: system D-Bus disconnected")
+        owner_reply = await bus.call(Message(
+            destination="org.freedesktop.DBus",
+            path="/org/freedesktop/DBus",
+            interface="org.freedesktop.DBus",
+            member="GetNameOwner",
+            signature="s",
+            body=["org.bluez"],
+        ))
+        if owner_reply is None or owner_reply.message_type is MessageType.ERROR:
+            raise RuntimeError("Scanner health failed: BlueZ unavailable")
+        owner = owner_reply.body[0]
+        if self._bluez_owner is not None and owner != self._bluez_owner:
+            raise RuntimeError("Scanner health failed: BlueZ restarted")
+        self._bluez_owner = owner
+        reply = await bus.call(Message(
+            destination=owner,
+            path=f"/org/bluez/{self.adapter}",
+            interface="org.freedesktop.DBus.Properties",
+            member="GetAll",
+            signature="s",
+            body=["org.bluez.Adapter1"],
+        ))
+        if reply is None or reply.message_type is MessageType.ERROR:
+            raise RuntimeError("Scanner health failed: adapter unavailable")
+        properties = reply.body[0]
+        if not all(properties.get(name) and properties[name].value
+                   for name in ("Powered", "Discovering")):
+            raise RuntimeError("Scanner health failed: adapter not powered/discovering")
 
     async def stop(self) -> None:
         """Stop listening and cleanly cancel any active acquisition."""
@@ -183,26 +238,38 @@ class TrackyDaemon:
         self._running = False
         if self._scanner is not None:
             try:
-                await self._scanner.stop()
+                await bounded_await(self._scanner.stop())
             except Exception:
                 pass
             self._scanner = None
 
-        async with self._lock:
-            if self._active_operation_id is not None:
-                logger.info("Cancelling in-flight acquisition %s", self._active_operation_id)
-                try:
-                    await self.service.cancel(self._active_operation_id)
-                except Exception:
-                    pass
-                self._active_operation_id = None
+        if self._health_bus is not None:
+            self._health_bus.disconnect()
+            self._health_bus = None
 
+        async with self._lock:
+            operation_id = self._active_operation_id
+            active_task = self._active_task
+        if operation_id is not None:
+            logger.info("Cancelling in-flight acquisition %s", operation_id)
+            try:
+                # Iterator cleanup and disconnect each have a five-second bound.
+                await bounded_await(
+                    self.service.cancel(operation_id), 3 * CLEANUP_TIMEOUT_SECONDS
+                )
+            except Exception:
+                pass
+        if active_task is not None and active_task is not asyncio.current_task():
+            try:
+                await bounded_await(asyncio.shield(active_task))
+            except Exception:
+                pass
+        self._active_operation_id = None
         self.store.close()
         logger.info("Tracky daemon stopped cleanly.")
 
     async def run_forever(self) -> None:
         """Run until cancelled via asyncio cancellation or signal."""
-        await self.start()
         stop_event = asyncio.Event()
 
         def _signal_handler() -> None:
@@ -218,7 +285,17 @@ class TrackyDaemon:
                 pass
 
         try:
-            await stop_event.wait()
+            await self.start()
+            await bounded_await(self._check_scanner_health())
+            while not stop_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(), self._scanner_health_interval_seconds
+                    )
+                except TimeoutError:
+                    # Propagate failure: the CLI exits non-zero and systemd
+                    # restarts discovery. No ads is normal when nobody weighs in.
+                    await bounded_await(self._check_scanner_health())
         finally:
             await self.stop()
 
@@ -235,7 +312,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--adapter",
-        help="Bluetooth adapter name (e.g. hci0)",
+        help="Bluetooth adapter name (default: hci0)",
         default=None,
     )
     parser.add_argument(

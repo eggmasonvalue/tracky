@@ -67,10 +67,14 @@ class SyncWorker(
             )
             Result.retry()
         }
+        SyncRunResult.LocalNetworkPermissionMissing -> {
+            application.diagnostics.save("local_network_permission_required", LocalNetworkPermission.DENIED_MESSAGE)
+            Result.failure()
+        }
         SyncRunResult.HealthConnectPermissionsMissing -> {
             application.diagnostics.save(
                 "health_connect_permission_required",
-                "Grant Tracky height read and weight write permissions in Health Connect",
+                "Grant Tracky weight write permission in Health Connect; composition write permissions are optional",
             )
             Result.retry()
         }

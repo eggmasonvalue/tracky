@@ -178,6 +178,7 @@ class AcquisitionCompletionPolicy:
 
         if self._last_decision is not None:
             return self._last_decision
+        active_count = self._active_count
         self._commit_active_run()
 
         latest = self.latest_measurement
@@ -193,6 +194,11 @@ class AcquisitionCompletionPolicy:
                             MeasurementQuality.CONTACT_FAILED,
                             "stable_complete_zero_word_burst",
                         )
+                    if any(value == 0 for value in burst.opaque_words):
+                        return self._remember(
+                            MeasurementQuality.INDETERMINATE,
+                            "stable_complete_partial_zero_word_burst",
+                        )
                     return self._remember(
                         MeasurementQuality.ACCEPTED,
                         "stable_complete_word_burst",
@@ -207,10 +213,10 @@ class AcquisitionCompletionPolicy:
                     "incomplete_zero_word_burst",
                 )
 
-        if self._all_zero(latest.word_block) and self._active_count >= self.stable_measurements:
+        if self._all_zero(latest.word_block) and active_count >= self.stable_measurements:
             return self._remember(MeasurementQuality.CONTACT_FAILED, "stable_zero_word_block")
 
-        if self._active_count >= self.stable_measurements:
+        if active_count >= self.stable_measurements:
             return self._remember(
                 MeasurementQuality.INDETERMINATE,
                 "stable_measurement_without_accepted_word_burst",

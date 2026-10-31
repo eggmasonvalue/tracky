@@ -1,99 +1,149 @@
 package dev.eggmasonvalue.tracky.core.healthconnect
 
+import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.BasalMetabolicRateRecord
 import androidx.health.connect.client.records.BodyFatRecord
+import androidx.health.connect.client.records.BodyWaterMassRecord
 import androidx.health.connect.client.records.BoneMassRecord
 import androidx.health.connect.client.records.LeanBodyMassRecord
+import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.WeightRecord
-import dev.eggmasonvalue.tracky.core.derivation.DerivationResult
-import dev.eggmasonvalue.tracky.core.sync.WeightProjection
+import dev.eggmasonvalue.tracky.core.sync.testComposition
+import dev.eggmasonvalue.tracky.core.sync.testInstant
+import dev.eggmasonvalue.tracky.core.sync.testProjection
 import java.time.Instant
+import java.time.ZoneId
+import java.time.ZoneOffset
+import kotlin.reflect.KClass
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HealthConnectManagerTest {
-
-    private val now = Instant.parse("2026-09-16T10:00:00Z")
-
-    private val weightOnlyProjection = WeightProjection(
-        sourceSessionId = "session-1",
-        clientRecordId = "tracky-linux-weight-v1-abcdef1234567890",
-        clientRecordVersion = 1L,
-        contractVersion = 1,
-        selectionPolicyVersion = 1,
-        derivationVersion = null,
-        weightKg = 70.0,
-        observedAt = now,
-        sourceQuality = "accepted",
-        derivation = null,
-    )
-
-    private val derivation = DerivationResult(
-        derivationVersion = 1,
-        bodyFatPct = 31.5,
-        waterKg = 35.1,
-        proteinKg = 10.1,
-        skeletalMuscleKg = 26.4,
-        boneKg = 2.8,
-        leanBodyMassKg = 48.0,
-        bmrKcal = 1406,
-    )
-
-    private val fullProjection = weightOnlyProjection.copy(
-        derivationVersion = 1,
-        derivation = derivation,
-    )
+    private val projection = testProjection().copy(composition = testComposition)
+    private val allPermissions = HealthConnectManager.REQUESTED_PERMISSIONS
+    private val weightPermission = HealthConnectManager.REQUIRED_PERMISSIONS
 
     @Test
-    fun `buildRecords with weight only creates single WeightRecord`() {
-        val records = HealthConnectManager.buildRecords(weightOnlyProjection)
-        assertEquals(1, records.size)
-        val weightRecord = records[0] as WeightRecord
-        assertEquals(70.0, weightRecord.weight.inKilograms, 0.0)
-        assertEquals(now, weightRecord.time)
-        assertEquals("tracky-linux-weight-v1-abcdef1234567890", weightRecord.metadata.clientRecordId)
-        assertEquals(1L, weightRecord.metadata.clientRecordVersion)
-        assertEquals("Tracky", weightRecord.metadata.device?.manufacturer)
+    fun `composition produces exactly six records with Linux values stable IDs version and scale metadata`() {
+        val records = HealthConnectManager.buildRecords(projection, allPermissions)
+        assertEquals(6, records.size)
+        assertEquals(78.9, (records[0] as WeightRecord).weight.inKilograms, 0.0)
+        assertEquals(24.4, (records[1] as BodyFatRecord).percentage.value, 0.0)
+        assertEquals(57.8, (records[2] as LeanBodyMassRecord).mass.inKilograms, 0.0)
+        assertEquals(42.1, (records[3] as BodyWaterMassRecord).mass.inKilograms, 0.0)
+        assertEquals(3.41, (records[4] as BoneMassRecord).mass.inKilograms, 0.0)
+        assertEquals(1618.0, (records[5] as BasalMetabolicRateRecord).basalMetabolicRate.inKilocaloriesPerDay, 0.0)
+        val suffixes = listOf("weight", "body-fat", "lean-body-mass", "body-water-mass", "bone-mass", "bmr")
+        records.zip(suffixes).forEach { (record, suffix) ->
+            assertEquals(projection.clientRecordIdFor(suffix), record.metadata.clientRecordId)
+            assertEquals(2L, record.metadata.clientRecordVersion)
+            assertEquals("Tracky", record.metadata.device?.manufacturer)
+            assertEquals("TS-CS10B", record.metadata.device?.model)
+            assertEquals(androidx.health.connect.client.records.metadata.Device.TYPE_SCALE, record.metadata.device?.type)
+        }
     }
 
     @Test
-    fun `buildRecords with derivation creates all 5 Health Connect records`() {
-        val records = HealthConnectManager.buildRecords(fullProjection)
-        assertEquals(5, records.size)
+    fun `only weight permission is required and no reads are requested`() {
+        assertEquals(setOf(HealthPermission.getWritePermission(WeightRecord::class)), weightPermission)
+        assertEquals(6, allPermissions.size)
+        assertTrue(allPermissions.all { it.startsWith("android.permission.health.WRITE_") })
+        val records = HealthConnectManager.buildRecords(projection, weightPermission)
+        assertEquals(1, records.size)
+        assertTrue(records.single() is WeightRecord)
+    }
 
-        // 1. WeightRecord
-        val weightRecord = records[0] as WeightRecord
-        assertEquals(70.0, weightRecord.weight.inKilograms, 0.0)
-        assertEquals(now, weightRecord.time)
-        assertEquals("tracky-linux-weight-v1-abcdef1234567890", weightRecord.metadata.clientRecordId)
+    @Test
+    fun `every derived type is independently permission gated`() {
+        val types = listOf(BodyFatRecord::class, LeanBodyMassRecord::class, BodyWaterMassRecord::class, BoneMassRecord::class, BasalMetabolicRateRecord::class)
+        for (type in types) {
+            val permission = HealthPermission.getWritePermission(type)
+            val without = HealthConnectManager.buildRecords(projection, allPermissions - permission)
+            assertEquals(5, without.size)
+            assertFalse(without.any { it::class == type })
+            val only = HealthConnectManager.buildRecords(projection, weightPermission + permission)
+            assertEquals(listOf(WeightRecord::class, type), only.map { it::class })
+        }
+        assertThrows(IllegalStateException::class.java) { HealthConnectManager.buildRecords(projection, emptySet()) }
+    }
 
-        // 2. BodyFatRecord
-        val fatRecord = records[1] as BodyFatRecord
-        assertEquals(31.5, fatRecord.percentage.value, 0.0)
-        assertEquals(now, fatRecord.time)
-        assertEquals("tracky-linux-weight-v1-abcdef1234567890-fat", fatRecord.metadata.clientRecordId)
-        assertEquals(1L, fatRecord.metadata.clientRecordVersion)
+    @Test
+    fun `null composition deletes all five derived IDs before inserting weight and is replay safe`() = runTest {
+        val deletions = mutableListOf<Pair<KClass<out Record>, String>>()
+        val stored = HealthConnectManager.buildRecords(projection, allPermissions).associateBy { it.metadata.clientRecordId }.toMutableMap()
+        repeat(2) {
+            val ids = HealthConnectManager.projectSession(
+                projection.copy(composition = null, clientRecordVersion = 3, derivationVersion = 3),
+                allPermissions,
+                insert = { records ->
+                    assertEquals(1, records.size)
+                    assertEquals(1, stored.size)
+                    records.forEach { stored[it.metadata.clientRecordId] = it }
+                    listOf("hc-weight")
+                },
+                delete = { type, id -> deletions.add(type to id); stored.remove(id) },
+            )
+            assertEquals(listOf("hc-weight"), ids)
+        }
+        assertEquals(10, deletions.size)
+        assertEquals(setOf("body-fat", "lean-body-mass", "body-water-mass", "bone-mass", "bmr").map(projection::clientRecordIdFor).toSet(), deletions.take(5).map { it.second }.toSet())
+        assertEquals(setOf(projection.clientRecordId), stored.keys)
+    }
 
-        // 3. LeanBodyMassRecord
-        val lbmRecord = records[2] as LeanBodyMassRecord
-        assertEquals(48.0, lbmRecord.mass.inKilograms, 0.0)
-        assertEquals(now, lbmRecord.time)
-        assertEquals("tracky-linux-weight-v1-abcdef1234567890-lbm", lbmRecord.metadata.clientRecordId)
-        assertEquals(1L, lbmRecord.metadata.clientRecordVersion)
+    @Test
+    fun `weight-only sync does not attempt unpermitted derived operations`() = runTest {
+        for (composition in listOf(testComposition, null)) {
+            val ids = HealthConnectManager.projectSession(
+                projection.copy(composition = composition), weightPermission,
+                insert = { records -> assertTrue(records.single() is WeightRecord); listOf("hc-weight") },
+                delete = { _, _ -> error("Unpermitted deletion") },
+            )
+            assertEquals(listOf("hc-weight"), ids)
+        }
+    }
 
-        // 4. BoneMassRecord
-        val boneRecord = records[3] as BoneMassRecord
-        assertEquals(2.8, boneRecord.mass.inKilograms, 0.0)
-        assertEquals(now, boneRecord.time)
-        assertEquals("tracky-linux-weight-v1-abcdef1234567890-bone", boneRecord.metadata.clientRecordId)
-        assertEquals(1L, boneRecord.metadata.clientRecordVersion)
+    @Test
+    fun `composition insertion returns every ID and incomplete responses fail`() = runTest {
+        val expected = (1..6).map { "hc-$it" }
+        assertEquals(expected, HealthConnectManager.projectSession(
+            projection, allPermissions,
+            insert = { expected }, delete = { _, _ -> error("Unexpected deletion") },
+        ))
+        try {
+            HealthConnectManager.projectSession(projection, allPermissions, insert = { listOf("hc-one") }, delete = { _, _ -> })
+            error("Expected incomplete response rejection")
+        } catch (error: IllegalStateException) {
+            assertEquals("Health Connect did not return every record ID", error.message)
+        }
+    }
 
-        // 5. BasalMetabolicRateRecord
-        val bmrRecord = records[4] as BasalMetabolicRateRecord
-        assertEquals(1406.0, bmrRecord.basalMetabolicRate.inKilocaloriesPerDay, 0.0)
-        assertEquals(now, bmrRecord.time)
-        assertEquals("tracky-linux-weight-v1-abcdef1234567890-bmr", bmrRecord.metadata.clientRecordId)
-        assertEquals(1L, bmrRecord.metadata.clientRecordVersion)
+    @Test
+    fun `all records use local zone offset at the observation instant including daylight saving`() {
+        val zone = ZoneId.of("America/New_York")
+        for ((time, offset) in listOf(
+            Instant.parse("2026-07-01T10:00:00Z") to ZoneOffset.ofHours(-4),
+            Instant.parse("2026-01-01T10:00:00Z") to ZoneOffset.ofHours(-5),
+        )) {
+            val records = HealthConnectManager.buildRecords(projection.copy(observedAt = time), allPermissions, zone)
+            records.forEach { record ->
+                val actual = when (record) {
+                    is WeightRecord -> record.time to record.zoneOffset
+                    is BodyFatRecord -> record.time to record.zoneOffset
+                    is LeanBodyMassRecord -> record.time to record.zoneOffset
+                    is BodyWaterMassRecord -> record.time to record.zoneOffset
+                    is BoneMassRecord -> record.time to record.zoneOffset
+                    is BasalMetabolicRateRecord -> record.time to record.zoneOffset
+                    else -> error("Unexpected record type")
+                }
+                assertEquals(time to offset, actual)
+            }
+        }
+        val india = HealthConnectManager.buildRecords(projection, allPermissions, ZoneId.of("Asia/Kolkata"))
+        assertEquals(ZoneOffset.ofHoursMinutes(5, 30), (india.first() as WeightRecord).zoneOffset)
+        assertEquals(testInstant, india.first().let { it as WeightRecord }.time)
     }
 }

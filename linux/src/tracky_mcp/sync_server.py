@@ -1,8 +1,9 @@
 """Authenticated, read-only Android observation projection.
 
-The Android bridge consumes only completed Linux sessions and the explicitly
-persisted weight-selection result. Acquisition owns the writable database;
-this process opens it read-only. The default listener is loopback. Production
+The Android bridge consumes Linux sessions, the explicitly persisted
+weight-selection result, and the body composition derived here from the
+session's wire evidence and the Linux-side profile. Acquisition owns the
+writable database; this process opens it read-only. The default listener is loopback. Production
 use requires either a certificate/key pair or an explicitly configured secure
 external TLS terminator in front of the loopback listener.
 """
@@ -16,6 +17,7 @@ import json
 import logging
 import os
 import ssl
+from dataclasses import asdict
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +25,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from tracky_mcp.derivation import (
+    DERIVATION_VERSION,
+    Composition,
+    Profile,
+    derive,
+    impedances_from_blocks,
+    load_profile,
+)
 from tracky_mcp.protocol import (
     DECODER_VERSION,
     QUALITY_VERSION,
@@ -38,7 +48,7 @@ from tracky_mcp.storage import (
 
 logger = logging.getLogger("tracky.sync_server")
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 TRANSPORT_VERSION = 1
 _CURSOR_PREFIX = "s1."
 _DEFAULT_LIMIT = 100
@@ -103,6 +113,7 @@ def _versions(session: MeasurementSession) -> dict[str, Any]:
         "decoder_versions": decoder_versions,
         "selection_policy_version": WEIGHT_SELECTION_POLICY_VERSION,
         "quality_version": session.quality_version,
+        "derivation_version": DERIVATION_VERSION,
     }
 
 
@@ -153,10 +164,36 @@ def _opaque_blocks(session: MeasurementSession) -> tuple[list[int] | None, list[
     return list(burst.block_a), list(burst.block_b)
 
 
-def extract_session_telemetry(session: MeasurementSession) -> dict[str, Any]:
-    """Project session metadata, selected weight frame, and opaque burst blocks."""
+def _weight_kg(selected: dict[str, Any] | None) -> float | None:
+    weight = (selected or {}).get("weight") or {}
+    if weight.get("unit") != "kg" or not weight.get("raw") or not weight.get("divisor"):
+        return None
+    return weight["raw"] / weight["divisor"]
+
+
+def _composition(
+    selected: dict[str, Any] | None,
+    block_a: list[int] | None,
+    block_b: list[int] | None,
+    profile: Profile | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    impedances = (
+        impedances_from_blocks(block_a, block_b) if block_a and block_b else None
+    )
+    result = derive(_weight_kg(selected), impedances, profile)
+    if isinstance(result, Composition):
+        return asdict(result), None
+    return None, result.value
+
+
+def extract_session_telemetry(
+    session: MeasurementSession, profile: Profile | None = None
+) -> dict[str, Any]:
+    """Project session metadata, selected weight, opaque blocks, and composition."""
 
     block_a, block_b = _opaque_blocks(session)
+    selected = _selected_weight(session)
+    composition, unavailable = _composition(selected, block_a, block_b, profile)
     return {
         "contract_version": CONTRACT_VERSION,
         "session_id": session.id,
@@ -165,9 +202,11 @@ def extract_session_telemetry(session: MeasurementSession) -> dict[str, Any]:
         "quality": session.quality.value,
         "quality_version": session.quality_version,
         "selection_policy_version": WEIGHT_SELECTION_POLICY_VERSION,
-        "selected": _selected_weight(session),
+        "selected": selected,
         "opaque_block_a": block_a,
         "opaque_block_b": block_b,
+        "composition": composition,
+        "composition_unavailable": unavailable,
         "device_alias": session.device_alias,
         "versions": _versions(session),
     }
@@ -188,6 +227,7 @@ def _page_versions(sessions: list[MeasurementSession]) -> dict[str, Any]:
             if len(quality_versions) == 1
             else QUALITY_VERSION
         ),
+        "derivation_version": DERIVATION_VERSION,
     }
 
 
@@ -196,6 +236,7 @@ def _page_body(
     *,
     next_cursor: str | None,
     source_state: dict[str, str] | None = None,
+    profile: Profile | None = None,
 ) -> dict[str, Any]:
     return {
         "ok": True,
@@ -204,13 +245,14 @@ def _page_body(
         "source_state": source_state or {"kind": "ready"},
         "count": len(sessions),
         "next_cursor": next_cursor,
-        "sessions": [extract_session_telemetry(session) for session in sessions],
+        "sessions": [extract_session_telemetry(session, profile) for session in sessions],
     }
 
 
 def create_sync_handler(
     db_path: str | os.PathLike[str] | None = None,
     auth_token: str | None = None,
+    profile: Profile | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create a handler with mandatory bearer authentication."""
 
@@ -325,7 +367,7 @@ def create_sync_handler(
             next_cursor = _encode_cursor(sessions[-1]) if sessions else cursor_str
             self._send_json(
                 HTTPStatus.OK,
-                _page_body(sessions, next_cursor=next_cursor),
+                _page_body(sessions, next_cursor=next_cursor, profile=profile),
             )
 
         def log_message(self, format: str, *args: Any) -> None:
@@ -347,6 +389,7 @@ def run_sync_server(
     tls_cert_file: str | None = None,
     tls_key_file: str | None = None,
     external_tls_termination: bool = False,
+    profile_file: str | None = None,
 ) -> None:
     """Run the secure sync API.
 
@@ -369,7 +412,10 @@ def run_sync_server(
     if external_tls_termination and not _is_loopback(host):
         raise ValueError("external TLS termination mode must bind to loopback")
 
-    handler = create_sync_handler(db_path=db_path, auth_token=token)
+    profile = load_profile(profile_file) if profile_file else None
+    if profile is None:
+        logger.warning("no profile configured; sessions carry weight only")
+    handler = create_sync_handler(db_path=db_path, auth_token=token, profile=profile)
     server = ThreadingHTTPServer((host, port), handler)
     scheme = "http"
     if tls_cert_file is not None and tls_key_file is not None:
@@ -406,6 +452,11 @@ def main() -> None:
         action="store_true",
         help="Explicitly allow loopback HTTP behind a trusted TLS terminator",
     )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="TOML profile with height_cm; without it no composition is derived",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
@@ -421,6 +472,7 @@ def main() -> None:
         tls_cert_file=args.tls_cert_file,
         tls_key_file=args.tls_key_file,
         external_tls_termination=args.external_tls_termination,
+        profile_file=args.profile,
     )
 
 

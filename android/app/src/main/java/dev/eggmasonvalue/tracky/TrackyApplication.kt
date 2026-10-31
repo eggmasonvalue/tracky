@@ -6,6 +6,7 @@ import dev.eggmasonvalue.tracky.core.data.RoomImportLedger
 import dev.eggmasonvalue.tracky.core.data.TrackyDatabase
 import dev.eggmasonvalue.tracky.core.healthconnect.HealthConnectManager
 import dev.eggmasonvalue.tracky.core.sync.HttpObservationTransport
+import dev.eggmasonvalue.tracky.core.sync.LocalNetworkPermission
 import dev.eggmasonvalue.tracky.core.sync.SecureSyncConfigStore
 import dev.eggmasonvalue.tracky.core.sync.SyncRunner
 import dev.eggmasonvalue.tracky.core.sync.SyncRunResult
@@ -29,7 +30,10 @@ class TrackyApplication : Application() {
         private set
     private val syncMutex = Mutex()
 
-    suspend fun runSerializedSync(): SyncRunResult = syncMutex.withLock { syncRunner.run() }
+    suspend fun runSerializedSync(): SyncRunResult = syncMutex.withLock {
+        if (!LocalNetworkPermission.isGranted(this)) SyncRunResult.LocalNetworkPermissionMissing
+        else syncRunner.run()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -39,7 +43,7 @@ class TrackyApplication : Application() {
         importLedger = RoomImportLedger(database)
         configStore = SecureSyncConfigStore(this)
         diagnostics = DiagnosticsRepository(this)
-        healthConnectManager = HealthConnectManager(this, clock)
+        healthConnectManager = HealthConnectManager(this)
         syncRunner = SyncRunner(
             configSource = configStore,
             ledger = importLedger,

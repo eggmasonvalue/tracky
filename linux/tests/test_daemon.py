@@ -82,6 +82,89 @@ def test_daemon_uses_active_bleak_discovery_configuration(
     assert callable(captured["detection_callback"])
 
 
+def test_scanner_health_failure_escapes_run_forever_for_systemd_restart(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner = FakeScanner(lambda *_args: None)
+    daemon = TrackyDaemon(
+        store=SQLiteMeasurementStore(tmp_path / "health.sqlite3"),
+        scanner_factory=lambda **_kwargs: scanner,
+        scanner_health_interval_seconds=0.01,
+    )
+    checks = 0
+
+    async def health() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("adapter lost")
+
+    monkeypatch.setattr(daemon, "_check_scanner_health", health)
+    with pytest.raises(RuntimeError, match="adapter lost"):
+        asyncio.run(daemon.run_forever())
+    assert checks == 2
+    assert scanner.started and scanner.stopped
+    assert not daemon._running
+
+
+@pytest.mark.parametrize("failure", [
+    "owner_changed", "powered_off", "not_discovering", "adapter_removed", "bus_disconnected",
+])
+def test_health_probe_detects_bluez_and_adapter_loss_without_advertisements(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    error = object()
+    state = {"owner": ":1.10", "Powered": True, "Discovering": True, "present": True}
+
+    class Bus:
+        connected = True
+
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def connect(self) -> Any:
+            return self
+
+        async def call(self, message: Any) -> Any:
+            if message.member == "GetNameOwner":
+                return SimpleNamespace(message_type=None, body=[state["owner"]])
+            assert message.path == "/org/bluez/hci0"
+            return SimpleNamespace(
+                message_type=None if state["present"] else error,
+                body=[{name: SimpleNamespace(value=state[name])
+                       for name in ("Powered", "Discovering")}],
+            )
+
+    module = ModuleType("dbus_fast")
+    module.BusType = SimpleNamespace(SYSTEM="system")  # type: ignore[attr-defined]
+    module.Message = lambda **kwargs: SimpleNamespace(**kwargs)  # type: ignore[attr-defined]
+    module.MessageType = SimpleNamespace(ERROR=error)  # type: ignore[attr-defined]
+    aio = ModuleType("dbus_fast.aio")
+    aio.MessageBus = Bus  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "dbus_fast", module)
+    monkeypatch.setitem(sys.modules, "dbus_fast.aio", aio)
+
+    async def scenario() -> None:
+        with SQLiteMeasurementStore(tmp_path / "probe.sqlite3") as store:
+            daemon = TrackyDaemon(store=store)
+            await daemon._check_scanner_health()
+            await daemon._check_scanner_health()  # Quiet airwaves are healthy.
+            if failure == "owner_changed":
+                state["owner"] = ":1.11"
+            elif failure == "powered_off":
+                state["Powered"] = False
+            elif failure == "not_discovering":
+                state["Discovering"] = False
+            elif failure == "adapter_removed":
+                state["present"] = False
+            else:
+                daemon._health_bus.connected = False
+            with pytest.raises(RuntimeError, match="Scanner health failed"):
+                await daemon._check_scanner_health()
+
+    asyncio.run(scenario())
+
+
 def test_daemon_ignores_non_scale_devices(tmp_path: Any) -> None:
     store = SQLiteMeasurementStore(path=tmp_path / "test.db")
     scanner: FakeScanner | None = None

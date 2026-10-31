@@ -6,13 +6,12 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import dev.eggmasonvalue.tracky.core.data.DiagnosticsRepository
 import dev.eggmasonvalue.tracky.core.healthconnect.HealthConnectManager
-import dev.eggmasonvalue.tracky.core.healthconnect.HeightReadException
+import dev.eggmasonvalue.tracky.core.sync.LocalNetworkPermission
 import dev.eggmasonvalue.tracky.core.sync.SecureSyncConfigStore
 import dev.eggmasonvalue.tracky.core.sync.SyncEndpointValidator
 import dev.eggmasonvalue.tracky.core.sync.SyncScheduler
 import dev.eggmasonvalue.tracky.ui.model.BridgeAction
 import dev.eggmasonvalue.tracky.ui.model.BridgeUiState
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -45,31 +44,16 @@ class BridgeViewModel(
     fun refresh() {
         viewModelScope.launch {
             val available = healthConnectManager.isAvailable()
-            val authorized = available && healthConnectManager.hasRequiredPermissions()
-            var heightReadError: String? = null
-            val height = if (authorized) {
-                try {
-                    healthConnectManager.readLatestApplicableHeight()
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: HeightReadException) {
-                    heightReadError = error.message
-                    null
-                } catch (_: Exception) {
-                    heightReadError = "Health Connect height could not be read; check its provider status."
-                    null
-                }
-            } else {
-                null
-            }
+            val permissions = if (available) healthConnectManager.grantedPermissions() else emptySet()
+            val authorized = permissions.containsAll(HealthConnectManager.REQUIRED_PERMISSIONS)
+            val compositionPermissions = HealthConnectManager.REQUESTED_PERMISSIONS - HealthConnectManager.REQUIRED_PERMISSIONS
             val config = runCatching { configStore.load() }.getOrNull()
             val storedDiagnostics = diagnostics.read()
             _uiState.value = _uiState.value.copy(
                 healthConnectAvailable = available,
                 healthConnectAuthorized = authorized,
-                latestHeightCm = height?.heightCentimeters,
-                latestHeightAt = height?.recordedAt?.toString(),
-                heightReadError = heightReadError,
+                compositionPermissionsGranted = permissions.intersect(compositionPermissions).size,
+                localNetworkAuthorized = LocalNetworkPermission.isGranted(appContext),
                 configured = config != null,
                 endpoint = config?.endpoint,
                 diagnosticsMessage = storedDiagnostics?.message,
@@ -82,6 +66,10 @@ class BridgeViewModel(
         when (action) {
             BridgeAction.RequestHealthPermissions ->
                 _effects.tryEmit(HostEffect.RequestHealthPermissions)
+            BridgeAction.RequestLocalNetworkPermission ->
+                _effects.tryEmit(HostEffect.RequestLocalNetworkPermission)
+            BridgeAction.OpenAppSettings ->
+                _effects.tryEmit(HostEffect.OpenAppSettings)
             BridgeAction.Refresh -> refresh()
             BridgeAction.SyncNow -> {
                 SyncScheduler.triggerImmediateSync(appContext)
@@ -121,6 +109,8 @@ class BridgeViewModel(
 
     sealed interface HostEffect {
         data object RequestHealthPermissions : HostEffect
+        data object RequestLocalNetworkPermission : HostEffect
+        data object OpenAppSettings : HostEffect
     }
 
     class Factory(

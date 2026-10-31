@@ -385,6 +385,16 @@ class SQLiteMeasurementStore:
             )
         else:
             self._connection = sqlite3.connect(str(selected))
+        # SQLite creates WAL/SHM with the database's mode. Set it before any
+        # schema access, and repair sidecars left by older 0600 installations.
+        # The service's tracky group and 0750 state directory grant MCP reads
+        # without granting directory or database writes to the human user.
+        if not self.read_only and not self._memory:
+            selected.chmod(0o640)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{selected}{suffix}")
+                if sidecar.exists():
+                    sidecar.chmod(0o640)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
@@ -392,10 +402,7 @@ class SQLiteMeasurementStore:
             self._connection.execute("PRAGMA query_only = ON")
         self._initialize()
         if not self.read_only and not self._memory:
-            try:
-                selected.chmod(0o600)
-            except OSError:
-                pass
+            self._connection.execute("PRAGMA journal_mode = WAL")
 
     def _initialize(self) -> None:
         revision = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
@@ -405,8 +412,6 @@ class SQLiteMeasurementStore:
             with self._connection:
                 self._connection.executescript(_SCHEMA)
                 self._connection.execute(f"PRAGMA user_version = {SCHEMA_REVISION}")
-            if not self._memory:
-                self._connection.execute("PRAGMA journal_mode = WAL")
             return
         if revision == 3:
             if self.read_only:
@@ -679,25 +684,25 @@ class SQLiteMeasurementStore:
     ) -> None:
         """Bind a pending operation to its durable session and mark it running."""
 
-        started_text = _timestamp(started_at, name="started_at")
         with self._connection:
-            session = self._connection.execute(
-                "SELECT status FROM measurement_sessions WHERE id = ?", (session_id,)
-            ).fetchone()
-            if session is None:
-                raise SessionNotFoundError(session_id)
-            if session["status"] != SessionStatus.OPEN.value:
-                raise SessionClosedError(f"session {session_id} is {session['status']}")
-            cursor = self._connection.execute(
-                """
-                UPDATE acquisition_operations
-                SET status = 'running', started_at_utc = ?, session_id = ?
-                WHERE id = ? AND status = 'pending'
-                """,
-                (started_text, session_id, operation_id),
-            )
-            if cursor.rowcount == 0:
-                self._raise_operation_transition_error(operation_id)
+            self._start_operation(operation_id, session_id=session_id, started_at=started_at)
+
+    def _start_operation(
+        self, operation_id: str, *, session_id: str, started_at: datetime
+    ) -> None:
+        """Bind within the caller's transaction; never commit independently."""
+
+        self._require_open(session_id)
+        cursor = self._connection.execute(
+            """
+            UPDATE acquisition_operations
+            SET status = 'running', started_at_utc = ?, session_id = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (_timestamp(started_at, name="started_at"), session_id, operation_id),
+        )
+        if cursor.rowcount == 0:
+            self._raise_operation_transition_error(operation_id)
 
     def complete_operation(self, operation_id: str, *, finished_at: datetime) -> None:
         self._finish_operation(
@@ -933,7 +938,11 @@ class SQLiteMeasurementStore:
         return [self.get_operation(row["id"]) for row in rows]
 
     def recover_interrupted_operations(self, *, recovered_at: datetime) -> list[str]:
-        """Fail nonterminal handles and abort linked open sessions after restart."""
+        """Fail nonterminal handles and abort every open session after restart.
+
+        This store has one acquisition owner. Unlinked sessions from older
+        non-atomic creation paths must not hold the sync cursor open forever.
+        """
 
         recovered_text = _timestamp(recovered_at, name="recovered_at")
         with self._connection:
@@ -944,24 +953,23 @@ class SQLiteMeasurementStore:
                 ORDER BY created_at_utc
                 """
             ).fetchall()
-            session_ids = [row["session_id"] for row in rows if row["session_id"] is not None]
-            self._connection.executemany(
+            self._connection.execute(
                 """
                 UPDATE measurement_sessions
-                SET status = 'aborted', ended_at_utc = ?, quality = ?,
-                    quality_version = ?, quality_reason = ?, completion_reason = ?
-                WHERE id = ? AND status = 'open'
+                SET status = 'aborted', ended_at_utc = MAX(?, started_at_utc), quality = ?,
+                    quality_version = ?, quality_reason = 'process_restarted',
+                    completion_reason = 'process_restarted',
+                    selected_frame_sequence = NULL, selection_policy_version = NULL
+                WHERE status = 'open'
                 """,
-                (
-                    (recovered_text, MeasurementQuality.INDETERMINATE.value, QUALITY_VERSION,
-                     "process_restarted", "process_restarted", session_id)
-                    for session_id in session_ids
-                ),
+                (recovered_text, MeasurementQuality.INDETERMINATE.value, QUALITY_VERSION),
             )
             self._connection.execute(
                 """
                 UPDATE acquisition_operations
-                SET status = 'failed', finished_at_utc = ?,
+                SET status = 'failed',
+                    finished_at_utc = MAX(?, created_at_utc,
+                                          COALESCE(started_at_utc, created_at_utc)),
                     error_code = 'process_restarted',
                     error_message = 'Acquisition interrupted by process restart'
                 WHERE status IN ('pending', 'running')
@@ -975,6 +983,7 @@ class SQLiteMeasurementStore:
         *,
         started_at: datetime,
         session_id: str | None = None,
+        operation_id: str | None = None,
         display_timezone: str = DEFAULT_DISPLAY_TIMEZONE,
         device_alias: str | None = None,
         model_label: str | None = None,
@@ -984,7 +993,7 @@ class SQLiteMeasurementStore:
         capture_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> str:
-        """Create an open session and return its opaque identifier."""
+        """Create a session, optionally binding a pending operation atomically."""
 
         identifier = session_id or str(uuid4())
         if not identifier:
@@ -1012,6 +1021,10 @@ class SQLiteMeasurementStore:
                     _json_object(metadata, name="metadata"),
                 ),
             )
+            if operation_id is not None:
+                self._start_operation(
+                    operation_id, session_id=identifier, started_at=started_at
+                )
         return identifier
 
     def _require_open(self, session_id: str) -> None:

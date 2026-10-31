@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from tracky_mcp.derivation import DERIVATION_VERSION, Profile
 from tracky_mcp.protocol import append_checksum
 from tracky_mcp.storage import SQLiteMeasurementStore
 from tracky_mcp.sync_server import create_sync_handler, extract_session_telemetry
@@ -100,6 +101,40 @@ def test_projection_exposes_only_persisted_selection(tmp_path: Any) -> None:
             assert projected["selected"] is None
 
 
+def _measurement(packet: int, words: list[int], weight_raw: int = 7000) -> bytes:
+    body = b"".join(word.to_bytes(2, "big") for word in words)
+    return append_checksum(
+        bytes((0x10, 0x12, 0x20)) + weight_raw.to_bytes(2, "big") + bytes((0x01, packet)) + body
+    )
+
+
+def test_composition_is_derived_from_wire_blocks_and_profile(tmp_path: Any) -> None:
+    started = datetime(2026, 9, 13, 7, 0, 0, tzinfo=timezone.utc)
+    frames = [
+        _measurement(0x21, [4300, 3650, 4200, 3550, 4600]),
+        _measurement(0x22, [3900, 4500, 3800, 250, 300]),
+    ]
+    with SQLiteMeasurementStore(tmp_path / "composition.db") as store:
+        session_id = store.create_session(started_at=started)
+        store.append_frames(session_id, frames)
+        store.complete_session(
+            session_id, ended_at=started, selected_frame_sequence=1, selection_policy_version=1
+        )
+        session = store.get_session(session_id)
+
+    with_profile = extract_session_telemetry(session, Profile(170.0))
+    composition = with_profile["composition"]
+    assert with_profile["composition_unavailable"] is None
+    assert with_profile["versions"]["derivation_version"] == DERIVATION_VERSION
+    assert composition["trunk_order"] == "transposed"
+    assert composition["body_fat_pct"] == 31.5
+    assert composition["basal_metabolic_rate_kcal_per_day"] == 1406
+
+    without_profile = extract_session_telemetry(session)
+    assert without_profile["composition"] is None
+    assert without_profile["composition_unavailable"] == "no_profile"
+
+
 def test_handler_requires_a_token_and_health_is_authenticated(tmp_path: Any) -> None:
     with pytest.raises(ValueError, match="bearer token"):
         create_sync_handler(db_path=tmp_path / "missing.db")
@@ -157,7 +192,7 @@ def test_completed_selected_sessions_are_consumed_with_opaque_cursor(tmp_path: A
     server, base_url = _make_server(db_path)
     try:
         data = _request(base_url, "/api/v1/sessions/unsynced")
-        assert data["contract_version"] == 1
+        assert data["contract_version"] == 2
         assert data["source_state"] == {"kind": "ready"}
         assert data["count"] == 2
         first = data["sessions"][0]

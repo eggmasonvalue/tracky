@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import argparse
+
 from tracky_mcp.storage import SQLiteMeasurementStore
 
 from . import create_server
 
 
 def main() -> None:
-    """Run one on-demand history server using the XDG SQLite database."""
+    """Run one on-demand, read-only history server over stdio."""
 
-    with SQLiteMeasurementStore(read_only=True) as store:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db-path", help="SQLite database path (default: XDG data directory)")
+    args = parser.parse_args()
+    with SQLiteMeasurementStore(path=args.db_path, read_only=True) as store:
         create_server(store).run(transport="stdio")
 
 

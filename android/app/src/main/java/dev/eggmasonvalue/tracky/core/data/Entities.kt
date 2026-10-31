@@ -25,11 +25,11 @@ data class ImportLedgerEntity(
     @ColumnInfo(name = "selection_policy_version")
     val selectionPolicyVersion: Int,
     @ColumnInfo(name = "derivation_version")
-    val derivationVersion: Int?,
+    val derivationVersion: Long?,
     @ColumnInfo(name = "disposition")
     val disposition: ImportDisposition,
-    @ColumnInfo(name = "health_connect_record_id")
-    val healthConnectRecordId: String?,
+    @ColumnInfo(name = "health_connect_record_ids", defaultValue = "'[]'")
+    val healthConnectRecordIds: List<String>,
     @ColumnInfo(name = "attempt_count")
     val attemptCount: Int,
     @ColumnInfo(name = "last_attempt_epoch_ms")
@@ -51,6 +51,8 @@ data class SyncStateEntity(
     val stateId: String = STATE_ID,
     @ColumnInfo(name = "cursor")
     val cursor: String?,
+    @ColumnInfo(name = "derivation_version", defaultValue = "0")
+    val derivationVersion: Long = 0,
 ) {
     companion object {
         const val STATE_ID: String = "linux-observation-cursor"

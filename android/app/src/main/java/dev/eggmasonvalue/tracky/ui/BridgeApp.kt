@@ -32,7 +32,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.eggmasonvalue.tracky.ui.model.BridgeAction
 import dev.eggmasonvalue.tracky.ui.model.BridgeUiState
-import java.text.NumberFormat
+import dev.eggmasonvalue.tracky.core.sync.LocalNetworkPermission
 
 @Composable
 fun BridgeApp(
@@ -61,8 +61,9 @@ fun BridgeApp(
         if (state.isRationaleEntry) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
                 Text(
-                    "Tracky reads height only to support future approved algorithms and writes weight observations received from Linux. " +
-                        "It never writes height, body fat, lean mass, or other unsupported body-composition values.",
+                    "Tracky reads nothing from Health Connect. It writes Linux-provided weight and, when available and permitted, " +
+                        "body fat, lean body mass, body water mass, bone mass and basal metabolic rate. " +
+                        "Linux owns the profile and calculations. Tracky never writes height, protein or skeletal muscle.",
                     modifier = Modifier.padding(16.dp),
                     style = MaterialTheme.typography.bodyMedium,
                 )
@@ -75,28 +76,40 @@ fun BridgeApp(
                 Text(
                     when {
                         !state.healthConnectAvailable -> "Health Connect is unavailable. Install or update it, then return through its permission screen."
-                        state.healthConnectAuthorized -> "Height history read and weight write access is granted."
-                        else -> "Permission is required to read height history and write weight projections."
+                        state.healthConnectAuthorized -> "Weight write access is granted. Optional composition permissions: ${state.compositionPermissionsGranted}/5."
+                        else -> "Only weight write permission is required for sync. Composition write permissions are optional."
                     },
                     style = MaterialTheme.typography.bodyMedium,
                 )
-                if (state.healthConnectAuthorized) {
-                    state.heightReadError?.let { error ->
-                        Text(
-                            error,
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    } ?: Text(
-                        state.latestHeightCm?.let {
-                            "Latest applicable height: ${formatCentimeters(it)} cm" +
-                                (state.latestHeightAt?.let { at -> " • $at" } ?: "")
-                        } ?: "No applicable HeightRecord is available. Tracky does not invent or write height.",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                } else {
-                    Button(onClick = { onAction(BridgeAction.RequestHealthPermissions) }) {
-                        Text("Connect Health Connect")
+                Text(
+                    "Tracky reads nothing from Health Connect. It writes weight and, with each optional permission, " +
+                        "Linux-provided body fat, lean body mass, body water mass, bone mass and basal metabolic rate. " +
+                        "If Linux cannot derive composition, Tracky removes derived records for types it can write.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Button(
+                    onClick = { onAction(BridgeAction.RequestHealthPermissions) },
+                    enabled = state.healthConnectAvailable,
+                ) {
+                    Text("Grant Health Connect writes")
+                }
+            }
+        }
+
+        Card {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Local network", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    if (state.localNetworkAuthorized) "Local network access is granted. Tracky can reach the Linux appliance over HTTPS."
+                    else LocalNetworkPermission.DENIED_MESSAGE,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                if (!state.localNetworkAuthorized) {
+                    Button(onClick = { onAction(BridgeAction.RequestLocalNetworkPermission) }) {
+                        Text("Allow local network")
+                    }
+                    TextButton(onClick = { onAction(BridgeAction.OpenAppSettings) }) {
+                        Text("Open app permissions")
                     }
                 }
             }
@@ -106,7 +119,9 @@ fun BridgeApp(
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("Secure Linux endpoint", style = MaterialTheme.typography.titleLarge)
                 Text(
-                    "Use the HTTPS base URL for the authenticated observation endpoint. The bearer token is encrypted with Android Keystore and is never shown or logged.",
+                    "Use the HTTPS base URL for the authenticated observation endpoint. Install your private CA certificate " +
+                        "in Android settings first; the server certificate must cover the endpoint's IP or hostname. " +
+                        "The bearer token is encrypted with Android Keystore and is never shown or logged.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 OutlinedTextField(
@@ -160,8 +175,3 @@ fun BridgeApp(
         Spacer(Modifier.height(8.dp))
     }
 }
-
-private fun formatCentimeters(value: Double): String = NumberFormat.getNumberInstance().apply {
-    minimumFractionDigits = 1
-    maximumFractionDigits = 1
-}.format(value)

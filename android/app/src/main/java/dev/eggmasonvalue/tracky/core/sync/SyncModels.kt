@@ -1,26 +1,15 @@
 package dev.eggmasonvalue.tracky.core.sync
 
-import dev.eggmasonvalue.tracky.core.derivation.DerivationResult
-import dev.eggmasonvalue.tracky.core.derivation.DerivationV1
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.security.MessageDigest
 import java.time.Instant
 
-const val OBSERVATION_CONTRACT_VERSION: Int = 1
+const val OBSERVATION_CONTRACT_VERSION: Int = 2
 const val TRANSPORT_VERSION: Int = 1
 const val SUPPORTED_DECODER_VERSION: Int = 2
-const val WEIGHT_PROJECTION_VERSION: Int = 1
 const val WEIGHT_SELECTION_POLICY_VERSION: Int = 1
 const val QUALITY_VERSION: Int = 1
-
-data class HeightObservation(
-    val recordedAt: Instant,
-    val heightMeters: Double,
-) {
-    val heightCentimeters: Double
-        get() = heightMeters * 100.0
-}
 
 data class ObservationVersions(
     val transportVersion: Int,
@@ -28,14 +17,12 @@ data class ObservationVersions(
     val decoderVersions: List<Int>,
     val selectionPolicyVersion: Int,
     val qualityVersion: Int,
+    val derivationVersion: Long,
 )
 
-data class PageSourceState(
-    val kind: String,
-    val code: String?,
-)
+data class PageSourceState(val kind: String, val code: String?)
 
-/** One source-declared weight value; no electrical or body-composition meaning is carried here. */
+/** One source-declared weight value, not an interpretation of electrical evidence. */
 data class SourceWeight(
     val raw: Long?,
     val divisor: Long?,
@@ -53,6 +40,15 @@ data class SourceWeight(
     }
 }
 
+/** Only Linux composition fields with corresponding Health Connect record types. */
+data class SourceComposition(
+    val bodyFatPct: Double,
+    val leanBodyMassKg: Double,
+    val bodyWaterKg: Double,
+    val boneMassKg: Double,
+    val basalMetabolicRateKcalPerDay: Double,
+)
+
 data class RemoteObservation(
     val sessionId: String?,
     val contractVersion: Int,
@@ -64,60 +60,61 @@ data class RemoteObservation(
     val selectionPolicyVersion: Int,
     val versions: ObservationVersions,
     val weight: SourceWeight?,
-    val opaqueBlockA: List<Int>? = null,
-    val opaqueBlockB: List<Int>? = null,
-    val impedances: List<Double>? = null,
+    val composition: SourceComposition? = null,
 )
 
 data class ObservationPage(
     val observations: List<RemoteObservation>,
-    /** Opaque server cursor. Android stores and returns it without decoding or constructing it. */
+    /** Opaque server cursor; Android neither decodes nor constructs it. */
     val nextCursor: String?,
     val versions: ObservationVersions,
     val sourceState: PageSourceState,
 )
 
-data class WeightProjection(
+data class SessionProjection(
     val sourceSessionId: String,
+    /** Weight ID is also the session's ledger key. */
     val clientRecordId: String,
     val clientRecordVersion: Long,
     val contractVersion: Int,
     val selectionPolicyVersion: Int,
-    val derivationVersion: Int?,
+    val derivationVersion: Long,
     val weightKg: Double,
     val observedAt: Instant,
     val sourceQuality: String,
-    val derivation: DerivationResult? = null,
-)
+    val composition: SourceComposition? = null,
+) {
+    fun clientRecordIdFor(suffix: String): String =
+        clientRecordId.removeSuffix("-weight") + "-$suffix"
+}
 
 sealed interface ObservationValidation {
-    data class Valid(
-        val projection: WeightProjection,
-        val impedances: List<Double>? = null,
-    ) : ObservationValidation
+    data class Valid(val projection: SessionProjection) : ObservationValidation
     data class Invalid(
-        val projection: WeightProjection,
+        val projection: SessionProjection,
         val errorCode: String,
         val errorMessage: String,
     ) : ObservationValidation
 }
 
-/** Validates the narrow weight-only import boundary before any Health Connect write. */
+/** Validates source-selected weight; Android never interprets opaque electrical evidence. */
 object ObservationValidator {
-    fun validate(observation: RemoteObservation): ObservationValidation {
+    fun validate(
+        observation: RemoteObservation,
+        derivationVersion: Long = observation.versions.derivationVersion,
+    ): ObservationValidation {
         val sessionId = observation.sessionId
-        val projection = WeightProjection(
+        val projection = SessionProjection(
             sourceSessionId = sessionId.orEmpty().ifBlank { INVALID_SESSION_ID },
             clientRecordId = clientRecordId(sessionId ?: INVALID_SESSION_ID),
-            clientRecordVersion = WEIGHT_PROJECTION_VERSION.toLong(),
+            clientRecordVersion = derivationVersion,
             contractVersion = observation.contractVersion,
             selectionPolicyVersion = observation.selectionPolicyVersion,
-            derivationVersion = null,
+            derivationVersion = derivationVersion,
             weightKg = 0.0,
             observedAt = observation.startedAt ?: Instant.EPOCH,
             sourceQuality = observation.quality.orEmpty(),
         )
-
         fun invalid(code: String, message: String): ObservationValidation.Invalid =
             ObservationValidation.Invalid(projection, code, message)
 
@@ -157,30 +154,19 @@ object ObservationValidator {
         }
         val observedAt = observation.startedAt
             ?: return invalid("missing_observed_at", "The source observation has no timestamp")
-
-        val impedances = observation.impedances
-            ?: if (observation.opaqueBlockA != null && observation.opaqueBlockB != null) {
-                DerivationV1.mapOpaqueBlocksToImpedances(
-                    observation.opaqueBlockA,
-                    observation.opaqueBlockB,
-                )
-            } else {
-                null
-            }
-
         return ObservationValidation.Valid(
-            projection = projection.copy(
+            projection.copy(
                 sourceSessionId = sessionId,
                 weightKg = kilograms,
                 observedAt = observedAt,
                 sourceQuality = observation.quality ?: "indeterminate",
+                composition = observation.composition,
             ),
-            impedances = impedances,
         )
     }
 
     fun clientRecordId(sourceSessionId: String): String =
-        "tracky-linux-weight-v$WEIGHT_PROJECTION_VERSION-${sha256(sourceSessionId).take(32)}"
+        "tracky-${sha256(sourceSessionId).take(32)}-weight"
 
     private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
         .digest(value.toByteArray(Charsets.UTF_8))
@@ -201,15 +187,11 @@ class SyncTransportException(
 ) : Exception(message)
 
 sealed interface SyncRunResult {
-    data class Success(
-        val imported: Int,
-        val alreadyTerminal: Int,
-        val quarantined: Int,
-    ) : SyncRunResult
-
+    data class Success(val imported: Int, val alreadyTerminal: Int, val quarantined: Int) : SyncRunResult
     data class Retry(val code: String) : SyncRunResult
     data class Failure(val code: String) : SyncRunResult
     data object NeedsConfiguration : SyncRunResult
     data object HealthConnectUnavailable : SyncRunResult
     data object HealthConnectPermissionsMissing : SyncRunResult
+    data object LocalNetworkPermissionMissing : SyncRunResult
 }

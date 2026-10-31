@@ -5,9 +5,8 @@ import androidx.compose.runtime.Immutable
 data class BridgeUiState(
     val healthConnectAvailable: Boolean = false,
     val healthConnectAuthorized: Boolean = false,
-    val latestHeightCm: Double? = null,
-    val latestHeightAt: String? = null,
-    val heightReadError: String? = null,
+    val compositionPermissionsGranted: Int = 0,
+    val localNetworkAuthorized: Boolean = false,
     val configured: Boolean = false,
     val endpoint: String? = null,
     val configurationError: String? = null,
@@ -19,6 +18,8 @@ data class BridgeUiState(
 @Immutable
 sealed interface BridgeAction {
     data object RequestHealthPermissions : BridgeAction
+    data object RequestLocalNetworkPermission : BridgeAction
+    data object OpenAppSettings : BridgeAction
     data object SyncNow : BridgeAction
     data object Refresh : BridgeAction
     data class SaveConfiguration(val endpoint: String, val token: String) : BridgeAction

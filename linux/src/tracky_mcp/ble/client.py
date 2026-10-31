@@ -25,6 +25,8 @@ from tracky_mcp.protocol import (
     WeightUnit,
 )
 
+from .cleanup import CLEANUP_TIMEOUT_SECONDS, bounded_await
+
 # Bleak accepts the canonical 128-bit representation for Bluetooth SIG 16-bit
 # UUIDs.  Keeping the values here avoids a transport dependency in protocol/.
 BLUETOOTH_BASE_UUID = "0000{}-0000-1000-8000-00805f9b34fb"
@@ -294,7 +296,11 @@ class ScaleClient:
         write_uuid: str = FFF2_WRITE_UUID,
         wire_observer: WireObserver | None = None,
         wire_clock: WireClock | None = None,
+        cleanup_timeout_seconds: float = CLEANUP_TIMEOUT_SECONDS,
     ) -> None:
+        if cleanup_timeout_seconds <= 0:
+            raise ValueError("cleanup_timeout_seconds must be greater than zero")
+        self._cleanup_timeout_seconds = cleanup_timeout_seconds
         if client is not None and client_factory is not None:
             raise TypeError("pass client or client_factory, not both")
 
@@ -416,16 +422,12 @@ class ScaleClient:
             self._notifications_started = True
             self._has_connected = True
         except BaseException:
-            self._connected = False
+            # A failed/cancelled connect can still leave a partially open link.
+            self._connected = True
             try:
-                if self._notifications_started:
-                    await _maybe_await(client.stop_notify(self.notify_uuid))
-            finally:
-                self._notifications_started = False
-                try:
-                    await _maybe_await(client.disconnect())
-                finally:
-                    self._queue_closed()
+                await self.disconnect()
+            except Exception:
+                pass
             raise
 
     def _disconnected_callback(self, _client: Any) -> None:
@@ -464,8 +466,18 @@ class ScaleClient:
         return any(marker in text for marker in markers)
 
     async def disconnect(self) -> None:
-        """Stop notifications, finish queued writes, and disconnect cleanly."""
+        """Release the link within a hard deadline, including pending writes."""
 
+        try:
+            await bounded_await(self._disconnect(), self._cleanup_timeout_seconds)
+        finally:
+            self._connected = False
+            self._notifications_started = False
+            self._queue_closed()
+            for task in tuple(self._pending_tasks):
+                task.cancel()
+
+    async def _disconnect(self) -> None:
         client = self._client
         if client is None:
             self._connected = False
@@ -548,6 +560,8 @@ class ScaleClient:
     def _notification_callback(self, _sender: Any, data: bytearray) -> SessionOutput | None:
         """Synchronous callback shape accepted by bleak and test doubles."""
 
+        if self._closed_queued:
+            return None
         try:
             output = self._feed_notification(data)
             self._schedule_writes(output.tx_writes)

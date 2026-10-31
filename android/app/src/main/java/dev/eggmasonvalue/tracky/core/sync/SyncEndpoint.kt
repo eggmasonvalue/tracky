@@ -20,7 +20,7 @@ object SyncEndpointValidator {
             throw IllegalArgumentException("Endpoint is not a valid URL")
         }
         require(uri.scheme.equals("https", ignoreCase = true)) {
-            "Endpoint must use HTTPS; configure a trusted HTTPS tunnel for local access"
+            "Endpoint must use HTTPS; install your private CA in Android settings for local access"
         }
         require(uri.userInfo == null) { "Endpoint must not contain URL credentials" }
         require(uri.host != null && uri.host.isNotBlank()) { "Endpoint must include a host" }

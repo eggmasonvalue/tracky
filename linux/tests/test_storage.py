@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +14,7 @@ import pytest
 
 from tracky_mcp.protocol import DECODER_ID, DECODER_VERSION, MeasurementQuality
 from tracky_mcp.storage import (
+    OperationNotFoundError,
     OperationStatus,
     SchemaRevisionError,
     SessionClosedError,
@@ -37,6 +40,74 @@ def test_default_database_path_honors_xdg_and_home() -> None:
     assert default_database_path(environ={"HOME": "/home/alice"}) == Path(
         "/home/alice/.local/share/tracky-mcp/tracky.sqlite3"
     )
+
+
+def test_session_creation_and_operation_binding_share_one_commit(tmp_path: Path) -> None:
+    with SQLiteMeasurementStore(tmp_path / "atomic.sqlite3") as store:
+        operation_id = store.create_operation(created_at=STARTED_AT)
+        statements: list[str] = []
+        store._connection.set_trace_callback(statements.append)
+        session_id = store.create_session(started_at=STARTED_AT, operation_id=operation_id)
+        store._connection.set_trace_callback(None)
+        operation = store.get_operation(operation_id)
+        assert operation.status is OperationStatus.RUNNING
+        assert operation.session_id == session_id
+        assert sum(sql == "COMMIT" for sql in statements) == 1
+        assert store.get_session(session_id).status is SessionStatus.OPEN
+
+
+def test_failed_binding_rolls_back_new_session(tmp_path: Path) -> None:
+    path = tmp_path / "atomic.sqlite3"
+    with SQLiteMeasurementStore(path) as store:
+        with pytest.raises(OperationNotFoundError):
+            store.create_session(started_at=STARTED_AT, operation_id="missing")
+        assert store.list_sessions() == []
+    with SQLiteMeasurementStore(path) as reopened:
+        assert reopened.list_sessions() == []
+
+
+def test_recovery_aborts_orphans_even_if_system_clock_moved_backwards(tmp_path: Path) -> None:
+    with SQLiteMeasurementStore(tmp_path / "recovery.sqlite3") as store:
+        future = STARTED_AT + timedelta(days=1)
+        operation_id = store.create_operation(created_at=future)
+        linked = store.create_session(started_at=future, operation_id=operation_id)
+        orphan = store.create_session(started_at=future)
+        assert store.recover_interrupted_operations(recovered_at=STARTED_AT) == [operation_id]
+        assert store.get_operation(operation_id).finished_at == future
+        for identifier in (linked, orphan):
+            session = store.get_session(identifier)
+            assert session.status is SessionStatus.ABORTED
+            assert session.ended_at == future
+
+
+def test_read_only_wal_reader_sees_live_writer_commits(tmp_path: Path) -> None:
+    path = tmp_path / "wal.sqlite3"
+    with SQLiteMeasurementStore(path) as writer:
+        first = writer.create_session(started_at=STARTED_AT)
+        writer.complete_session(first, ended_at=STARTED_AT)
+        assert writer._connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert Path(f"{path}-wal").exists()
+        assert Path(f"{path}-shm").exists()
+        with SQLiteMeasurementStore(path, read_only=True) as reader:
+            assert len(reader.list_sessions()) == 1
+            second = writer.create_session(started_at=STARTED_AT)
+            writer.complete_session(second, ended_at=STARTED_AT)
+            assert len(reader.list_sessions()) == 2
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                reader.create_session(started_at=STARTED_AT)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits required")
+def test_database_and_wal_sidecars_are_group_readable_not_writable(tmp_path: Path) -> None:
+    path = tmp_path / "modes.sqlite3"
+    with SQLiteMeasurementStore(path) as writer:
+        writer.create_session(started_at=STARTED_AT)
+        files = (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+        assert all(stat.S_IMODE(file.stat().st_mode) == 0o640 for file in files)
+        for file in files:
+            file.chmod(0o600)  # A legacy installation.
+        with SQLiteMeasurementStore(path):
+            assert all(stat.S_IMODE(file.stat().st_mode) == 0o640 for file in files)
 
 
 def test_revision_3_database_migrates_without_losing_canonical_evidence(tmp_path: Path) -> None:

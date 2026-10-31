@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from tracky_mcp.ble import ScaleClient, WireEvent, WireObserver
+from tracky_mcp.ble.cleanup import CLEANUP_TIMEOUT_SECONDS, bounded_await
 from tracky_mcp.protocol import (
     AcquisitionCompletionPolicy,
     CompletionDecision,
@@ -25,7 +26,6 @@ from tracky_mcp.storage import (
     AcquisitionOperation,
     MeasurementSession,
     OperationStatus,
-    SessionStatus,
     SQLiteMeasurementStore,
 )
 
@@ -90,8 +90,12 @@ class AcquisitionService:
         client_factory: ClientFactory | None = None,
         clock: Clock | None = None,
         recover_on_start: bool = True,
+        cleanup_timeout_seconds: float = CLEANUP_TIMEOUT_SECONDS,
     ) -> None:
+        if cleanup_timeout_seconds <= 0:
+            raise ValueError("cleanup_timeout_seconds must be greater than zero")
         self.store = store
+        self._cleanup_timeout_seconds = cleanup_timeout_seconds
         self._client_factory = client_factory or self._default_client_factory
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -179,6 +183,8 @@ class AcquisitionService:
             )
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        # Cancellation before the task's first turn never enters _run.
+        await self._close_failed_session(None, operation_id, cancelled=True)
         return self.get(operation_id)
 
     def _task_done(self, operation_id: str, task: asyncio.Task[None]) -> None:
@@ -197,10 +203,12 @@ class AcquisitionService:
     ) -> None:
         session_id: str | None = None
         client: AcquisitionClient | None = None
+        capturing = True
         try:
             started_at = self._now()
             session_id = self.store.create_session(
                 started_at=started_at,
+                operation_id=operation_id,
                 display_timezone=request.display_timezone,
                 device_alias=request.device_alias,
                 model_label=request.model_label,
@@ -209,18 +217,16 @@ class AcquisitionService:
                 condition=request.condition,
                 metadata=request.metadata,
             )
-            self.store.start_operation(
-                operation_id,
-                session_id=session_id,
-                started_at=started_at,
-            )
-
             policy = AcquisitionCompletionPolicy(
                 stable_measurements=request.stable_measurements,
                 idle_seconds=request.completion_idle_seconds,
             )
 
             def record_wire(event: WireEvent) -> None:
+                # A backend stuck in cancellation may deliver late callbacks.
+                # Closed sessions are immutable; teardown must not append them.
+                if not capturing:
+                    return
                 elapsed = max(
                     0,
                     int((event.observed_at - started_at).total_seconds() * 1000),
@@ -280,9 +286,10 @@ class AcquisitionService:
                 error_message=f"{type(exc).__name__}: {exc}",
             )
         finally:
+            capturing = False
             if client is not None:
                 try:
-                    await client.disconnect()
+                    await bounded_await(client.disconnect(), self._cleanup_timeout_seconds)
                 except Exception:
                     # The primary persisted outcome wins over a teardown race.
                     pass
@@ -332,11 +339,13 @@ class AcquisitionService:
                 )
                 for task in pending:
                     task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-
                 # Prefer an event delivered concurrently with stop/idle so a
                 # packet-2 response is not mistaken for an idle boundary.
                 if next_event in done:
+                    # Only the simple stop/idle waits are pending on this path.
+                    # A pending anext() on stop/idle is retired in finally so
+                    # its teardown cannot replace a successful capture outcome.
+                    await asyncio.gather(*pending, return_exceptions=True)
                     try:
                         event = next_event.result()
                     except StopAsyncIteration:
@@ -351,15 +360,22 @@ class AcquisitionService:
                 if idle is not None and idle in done:
                     return policy.finish("measurement_idle")
         finally:
-            active = [task for task in (next_event, stopped, idle) if task is not None]
-            for task in active:
-                if not task.done():
-                    task.cancel()
-            if active:
-                await asyncio.gather(*active, return_exceptions=True)
-            close = getattr(iterator, "aclose", None)
-            if close is not None:
-                await close()
+            async def close_iterator() -> None:
+                active = [task for task in (next_event, stopped, idle) if task is not None]
+                for task in active:
+                    if not task.done():
+                        task.cancel()
+                if active:
+                    await asyncio.gather(*active, return_exceptions=True)
+                close = getattr(iterator, "aclose", None)
+                if close is not None:
+                    await close()
+
+            try:
+                await bounded_await(close_iterator(), self._cleanup_timeout_seconds)
+            except Exception:
+                # Preserve the primary stop/cancellation/timeout outcome.
+                pass
 
     async def _close_failed_session(
         self,
@@ -375,7 +391,7 @@ class AcquisitionService:
         if operation.status not in {OperationStatus.PENDING, OperationStatus.RUNNING}:
             return
         status = OperationStatus.CANCELLED if cancelled else OperationStatus.FAILED
-        if session_id is not None and operation.status is OperationStatus.RUNNING:
+        if session_id is not None:
             self.store.finish_acquisition(
                 operation_id,
                 session_id=session_id,
@@ -388,16 +404,6 @@ class AcquisitionService:
                 completion_reason=error_code,
             )
             return
-        if session_id is not None:
-            session = self.store.get_session(session_id)
-            if session.status is SessionStatus.OPEN:
-                self.store.abort_session(
-                    session_id,
-                    ended_at=finished_at,
-                    quality=MeasurementQuality.INDETERMINATE,
-                    quality_reason=error_code,
-                    completion_reason=error_code,
-                )
         if cancelled:
             self.store.cancel_operation(
                 operation_id,

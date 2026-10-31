@@ -1,6 +1,6 @@
 package dev.eggmasonvalue.tracky.core.data
 
-import dev.eggmasonvalue.tracky.core.sync.WeightProjection
+import dev.eggmasonvalue.tracky.core.sync.SessionProjection
 import java.time.Instant
 
 /**
@@ -9,10 +9,10 @@ import java.time.Instant
  */
 interface ImportLedger {
     suspend fun find(clientRecordId: String): ImportLedgerEntry?
-    suspend fun markPending(projection: WeightProjection, now: Instant)
+    suspend fun markPending(projection: SessionProjection, now: Instant)
     suspend fun markImported(
         clientRecordId: String,
-        healthConnectRecordId: String,
+        healthConnectRecordIds: List<String>,
         now: Instant,
     )
     suspend fun markAttemptFailed(
@@ -23,12 +23,15 @@ interface ImportLedger {
         retryAfter: java.time.Duration,
     )
     suspend fun markQuarantined(
-        projection: WeightProjection,
+        projection: SessionProjection,
         now: Instant,
         errorCode: String,
         errorMessage: String,
     )
     suspend fun cursor(): String?
+    suspend fun derivationVersion(): Long
+    /** Persist the new version and clear the cursor in one atomic state-row write. */
+    suspend fun resetForDerivationVersion(version: Long)
     suspend fun advanceCursor(cursor: String?)
 }
 
@@ -40,7 +43,7 @@ class RoomImportLedger internal constructor(
     override suspend fun find(clientRecordId: String): ImportLedgerEntry? =
         dao.findImport(clientRecordId)?.toDomain()
 
-    override suspend fun markPending(projection: WeightProjection, now: Instant) {
+    override suspend fun markPending(projection: SessionProjection, now: Instant) {
         val previous = dao.findImport(projection.clientRecordId)?.toDomain()
         val attempts = previous?.attemptCount ?: 0
         dao.upsertImport(
@@ -52,7 +55,7 @@ class RoomImportLedger internal constructor(
                 selectionPolicyVersion = projection.selectionPolicyVersion,
                 derivationVersion = projection.derivationVersion,
                 disposition = ImportDisposition.PENDING,
-                healthConnectRecordId = null,
+                healthConnectRecordIds = previous?.healthConnectRecordIds.orEmpty(),
                 attemptCount = attempts,
                 lastAttemptEpochMs = previous?.lastAttemptAt?.toEpochMilli(),
                 nextRetryEpochMs = null,
@@ -65,17 +68,19 @@ class RoomImportLedger internal constructor(
 
     override suspend fun markImported(
         clientRecordId: String,
-        healthConnectRecordId: String,
+        healthConnectRecordIds: List<String>,
         now: Instant,
     ) {
-        require(healthConnectRecordId.isNotBlank()) { "Health Connect record ID must not be blank" }
+        require(healthConnectRecordIds.isNotEmpty() && healthConnectRecordIds.all { it.isNotBlank() }) {
+            "Health Connect record IDs must not be empty or blank"
+        }
         val previous = requireNotNull(dao.findImport(clientRecordId)) {
             "cannot import an unknown ledger entry"
         }
         dao.upsertImport(
             previous.copy(
                 disposition = ImportDisposition.IMPORTED,
-                healthConnectRecordId = healthConnectRecordId,
+                healthConnectRecordIds = healthConnectRecordIds,
                 attemptCount = previous.attemptCount + 1,
                 lastAttemptEpochMs = now.toEpochMilli(),
                 nextRetryEpochMs = null,
@@ -113,7 +118,7 @@ class RoomImportLedger internal constructor(
     }
 
     override suspend fun markQuarantined(
-        projection: WeightProjection,
+        projection: SessionProjection,
         now: Instant,
         errorCode: String,
         errorMessage: String,
@@ -129,7 +134,7 @@ class RoomImportLedger internal constructor(
                 selectionPolicyVersion = projection.selectionPolicyVersion,
                 derivationVersion = projection.derivationVersion,
                 disposition = ImportDisposition.QUARANTINED,
-                healthConnectRecordId = null,
+                healthConnectRecordIds = emptyList(),
                 attemptCount = 0,
                 lastAttemptEpochMs = now.toEpochMilli(),
                 nextRetryEpochMs = null,
@@ -143,11 +148,19 @@ class RoomImportLedger internal constructor(
     override suspend fun cursor(): String? =
         dao.findSyncState(SyncStateEntity.STATE_ID)?.cursor
 
+    override suspend fun derivationVersion(): Long =
+        dao.findSyncState(SyncStateEntity.STATE_ID)?.derivationVersion ?: 0L
+
+    override suspend fun resetForDerivationVersion(version: Long) {
+        require(version > 0L) { "derivation version must be positive" }
+        dao.upsertSyncState(SyncStateEntity(cursor = null, derivationVersion = version))
+    }
+
     override suspend fun advanceCursor(cursor: String?) {
         require(cursor == null || cursor.length <= MAX_CURSOR_LENGTH) {
             "sync cursor is too long"
         }
-        dao.upsertSyncState(SyncStateEntity(cursor = cursor))
+        dao.updateCursor(SyncStateEntity.STATE_ID, cursor)
     }
 
     private companion object {

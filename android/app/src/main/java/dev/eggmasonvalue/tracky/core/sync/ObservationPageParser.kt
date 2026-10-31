@@ -2,6 +2,7 @@ package dev.eggmasonvalue.tracky.core.sync
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.math.BigDecimal
 import java.time.Instant
 import java.time.OffsetDateTime
 
@@ -92,9 +93,22 @@ object ObservationPageParser {
             )
         }
         val startedAt = parseInstant(requiredString(item, "started_at_utc"))
-        val opaqueBlockA = optionalIntList(item, "opaque_block_a")
-        val opaqueBlockB = optionalIntList(item, "opaque_block_b")
-        val impedances = optionalDoubleList(item, "impedances")
+        if (!item.has("composition")) {
+            throw ObservationContractException("Observation has no composition field")
+        }
+        val composition = if (item.isNull("composition")) null else {
+            val value = item.requiredObject("composition")
+            if (requiredLong(value, "derivation_version") != pageVersions.derivationVersion) {
+                throw ObservationContractException("Composition version differs from page")
+            }
+            SourceComposition(
+                bodyFatPct = requiredDouble(value, "body_fat_pct"),
+                leanBodyMassKg = requiredDouble(value, "lean_body_mass_kg"),
+                bodyWaterKg = requiredDouble(value, "body_water_kg"),
+                boneMassKg = requiredDouble(value, "bone_mass_kg"),
+                basalMetabolicRateKcalPerDay = requiredDouble(value, "basal_metabolic_rate_kcal_per_day"),
+            )
+        }
         return RemoteObservation(
             sessionId = requiredString(item, "session_id"),
             contractVersion = itemContractVersion,
@@ -106,9 +120,7 @@ object ObservationPageParser {
             selectionPolicyVersion = requiredInt(item, "selection_policy_version"),
             versions = itemVersions,
             weight = weight,
-            opaqueBlockA = opaqueBlockA,
-            opaqueBlockB = opaqueBlockB,
-            impedances = impedances,
+            composition = composition,
         )
     }
 
@@ -131,7 +143,9 @@ object ObservationPageParser {
         if (decoderVersion != null && decoderVersion !in decoderVersions) {
             throw ObservationContractException("Decoder version is not in decoder_versions")
         }
-        return ObservationVersions(transport, decoderVersion, decoderVersions, selection, quality)
+        val derivation = requiredLong(value, "derivation_version")
+        if (derivation < 1L) throw ObservationContractException("Invalid derivation version")
+        return ObservationVersions(transport, decoderVersion, decoderVersions, selection, quality, derivation)
     }
 
     private fun versionsCompatible(
@@ -141,6 +155,7 @@ object ObservationPageParser {
         page.transportVersion == item.transportVersion &&
             page.selectionPolicyVersion == item.selectionPolicyVersion &&
             page.qualityVersion == item.qualityVersion &&
+            page.derivationVersion == item.derivationVersion &&
             item.decoderVersions.all(page.decoderVersions::contains)
 
     private fun parseSourceState(value: JSONObject): PageSourceState {
@@ -165,23 +180,27 @@ object ObservationPageParser {
         }
 
     private fun requiredInt(value: JSONObject, key: String): Int =
-        value.opt(key).let { raw ->
-            if (raw !is Number || raw.toDouble() % 1.0 != 0.0) {
-                throw ObservationContractException("$key is not an integer")
+        requiredLong(value, key).let { number ->
+            if (number !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) {
+                throw ObservationContractException("$key is outside the integer range")
             }
-            raw.toInt()
+            number.toInt()
         }
 
     private fun optionalInt(value: JSONObject, key: String): Int? =
         if (!value.has(key) || value.isNull(key)) null else requiredInt(value, key)
 
-    private fun requiredLong(value: JSONObject, key: String): Long =
-        value.opt(key).let { raw ->
-            if (raw !is Number || raw.toDouble() % 1.0 != 0.0) {
-                throw ObservationContractException("$key is not an integer")
-            }
-            raw.toLong()
+    private fun requiredLong(value: JSONObject, key: String): Long {
+        val raw = value.opt(key)
+        if (raw !is Number) throw ObservationContractException("$key is not an integer")
+        return try {
+            BigDecimal(raw.toString()).longValueExact()
+        } catch (_: ArithmeticException) {
+            throw ObservationContractException("$key is outside the integer range or fractional")
+        } catch (_: NumberFormatException) {
+            throw ObservationContractException("$key is not an integer")
         }
+    }
 
     private fun requiredBoolean(value: JSONObject, key: String): Boolean? =
         value.opt(key) as? Boolean
@@ -189,21 +208,13 @@ object ObservationPageParser {
     private fun optionalString(value: JSONObject, key: String): String? =
         if (!value.has(key) || value.isNull(key)) null else requiredString(value, key)
 
-    private fun optionalIntList(value: JSONObject, key: String): List<Int>? {
-        if (!value.has(key) || value.isNull(key)) return null
-        val array = value.optJSONArray(key) ?: return null
-        return buildList(array.length()) {
-            for (i in 0 until array.length()) add(array.getInt(i))
+    private fun requiredDouble(value: JSONObject, key: String): Double =
+        value.opt(key).let { raw ->
+            if (raw !is Number || !raw.toDouble().isFinite()) {
+                throw ObservationContractException("$key is not a finite number")
+            }
+            raw.toDouble()
         }
-    }
-
-    private fun optionalDoubleList(value: JSONObject, key: String): List<Double>? {
-        if (!value.has(key) || value.isNull(key)) return null
-        val array = value.optJSONArray(key) ?: return null
-        return buildList(array.length()) {
-            for (i in 0 until array.length()) add(array.getDouble(i))
-        }
-    }
 
     private fun JSONObject.requiredObject(key: String): JSONObject = try {
         getJSONObject(key)

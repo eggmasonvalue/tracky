@@ -3,11 +3,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.health.READ_HEIGHT" />
-    <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_HISTORY" />
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-permission android:name="android.permission.health.WRITE_WEIGHT" />
     <uses-permission android:name="android.permission.health.WRITE_BODY_FAT" />
     <uses-permission android:name="android.permission.health.WRITE_LEAN_BODY_MASS" />
+    <uses-permission android:name="android.permission.health.WRITE_BODY_WATER_MASS" />
     <uses-permission android:name="android.permission.health.WRITE_BONE_MASS" />
     <uses-permission android:name="android.permission.health.WRITE_BASAL_METABOLIC_RATE" />
 
@@ -15,6 +15,7 @@
         android:name=".TrackyApplication"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:icon="@mipmap/ic_launcher"
         android:label="Tracky bridge"
         android:roundIcon="@mipmap/ic_launcher_round"

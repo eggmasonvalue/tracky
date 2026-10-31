@@ -18,4 +18,7 @@ internal interface TrackyDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSyncState(state: SyncStateEntity)
+
+    @Query("UPDATE sync_state SET cursor = :cursor WHERE state_id = :stateId")
+    suspend fun updateCursor(stateId: String, cursor: String?)
 }
