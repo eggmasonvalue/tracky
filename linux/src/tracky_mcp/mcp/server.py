@@ -12,6 +12,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from tracky_mcp import __version__
+from tracky_mcp.derivation import Profile
 from tracky_mcp.storage import (
     MeasurementSessionSummary,
     SessionNotFoundError,
@@ -93,7 +94,9 @@ def _not_found(session_id: str) -> ErrorDetail:
     )
 
 
-def create_server(store: SQLiteMeasurementStore) -> MCPServer:
+def create_server(
+    store: SQLiteMeasurementStore, profile: Profile | None = None
+) -> MCPServer:
     """Build the read-only MCP projection without acquiring or recovering work.
 
     Acquisition ownership stays with the Linux daemon. This function only
@@ -109,7 +112,9 @@ def create_server(store: SQLiteMeasurementStore) -> MCPServer:
             "Read captured history only. Treat raw frames as evidence and decoded values "
             "as interpretations. Quality is a separate versioned field, and selected "
             "weight is present only when the contract supplies it. Keep opaque word blocks "
-            "unassigned to units, channels, frequencies, or physiological meaning."
+            "unassigned to units, channels, frequencies, or physiological meaning. "
+            "Composition is Linux-derived, derivation-versioned vendor-compatible output, "
+            "not clinical validation; preserve composition_unavailable when absent."
         ),
         version=__version__,
     )
@@ -147,17 +152,23 @@ def create_server(store: SQLiteMeasurementStore) -> MCPServer:
                 ok=False,
                 error=_error_detail("no_sessions", _NO_SESSIONS_MESSAGE),
             )
-        return SessionResource.from_record(session)
+        if profile is not None:
+            session = store.get_session(session.id)
+        return SessionResource.from_record(session, profile)
 
     @server.tool(annotations=_READ_ONLY)
     async def get_session(session_id: SessionId) -> SessionResource:
         """Return one session's metadata or a stable not-found result."""
 
         try:
-            session = store.get_session_summary(session_id)
+            session = (
+                store.get_session(session_id)
+                if profile is not None
+                else store.get_session_summary(session_id)
+            )
         except SessionNotFoundError:
             return SessionResource(ok=False, error=_not_found(session_id))
-        return SessionResource.from_record(session)
+        return SessionResource.from_record(session, profile)
 
     @server.tool(annotations=_READ_ONLY)
     async def get_session_evidence(session_id: SessionId) -> FramesResource:
@@ -176,10 +187,14 @@ def create_server(store: SQLiteMeasurementStore) -> MCPServer:
     )
     async def session_resource(session_id: str) -> str:
         try:
-            session = store.get_session_summary(session_id)
+            session = (
+                store.get_session(session_id)
+                if profile is not None
+                else store.get_session_summary(session_id)
+            )
         except SessionNotFoundError:
             return SessionResource(ok=False, error=_not_found(session_id)).model_dump_json()
-        return SessionResource.from_record(session).model_dump_json()
+        return SessionResource.from_record(session, profile).model_dump_json()
 
     @server.resource(
         "tracky://sessions/{session_id}/frames",

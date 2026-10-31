@@ -10,11 +10,14 @@ from pathlib import Path
 from types import MethodType
 from typing import Any
 
+import pytest
 from mcp import Client
 
+from tracky_mcp.derivation import DERIVATION_VERSION, Profile
 from tracky_mcp.mcp import create_server
-from tracky_mcp.protocol import MeasurementQuality
+from tracky_mcp.protocol import MeasurementQuality, append_checksum
 from tracky_mcp.storage import SQLiteMeasurementStore
+from tracky_mcp.sync_server import extract_session_telemetry
 
 NOW = datetime(2026, 8, 11, 18, 0, tzinfo=timezone.utc)
 FIXTURE = (
@@ -182,6 +185,8 @@ def test_read_only_mcp_surface_has_tool_equivalents_for_history_resources(
                 assert detail.structured_content is not None
                 assert detail.structured_content["session_id"] == session_id
                 assert detail.structured_content["summary"]["frame_count"] == 9
+                assert detail.structured_content["composition"] is None
+                assert detail.structured_content["composition_unavailable"] == "no_profile"
                 assert detail.structured_content["raw_frames"] == {
                     "resource_uri": f"tracky://sessions/{session_id}/frames",
                     "count": 9,
@@ -433,5 +438,100 @@ def test_read_only_tools_are_bounded_and_annotated(tmp_path: Path) -> None:
                 assert tools["get_session"].input_schema["properties"]["session_id"][
                     "maxLength"
                 ] == 128
+
+    asyncio.run(scenario())
+
+
+def _synthetic_measurement(packet: int, words: list[int]) -> bytes:
+    return append_checksum(
+        bytes((0x10, 0x12, 0x20))
+        + (7000).to_bytes(2, "big")
+        + bytes((0x01, packet))
+        + b"".join(word.to_bytes(2, "big") for word in words)
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("valid", None),
+        ("no_profile", "no_profile"),
+        ("unselected", "no_weight"),
+        ("unsupported_policy", "no_weight"),
+        ("incomplete", "no_impedance"),
+        ("corrupt", "no_impedance"),
+        ("reversed", "no_impedance"),
+        ("out_of_range", "impedance_out_of_range"),
+        ("limb_inversion", "limb_frequency_inversion"),
+    ],
+)
+def test_session_composition_matches_sync_projection(
+    tmp_path: Path, case: str, reason: str | None,
+) -> None:
+    async def scenario() -> None:
+        block_a = [4300, 3650, 4200, 3550, 4600]
+        block_b = [3900, 4500, 3800, 250, 300]
+        if case == "out_of_range":
+            block_a[0] = 8000
+        elif case == "limb_inversion":
+            block_a[1] = 4400
+        packet_a = _synthetic_measurement(0x21, block_a)
+        packet_b = _synthetic_measurement(0x22, block_b)
+        if case == "corrupt":
+            packet_a = packet_a[:-1] + bytes((packet_a[-1] ^ 1,))
+        frames = [packet_a, packet_b]
+        if case == "incomplete":
+            frames = [packet_a]
+        elif case == "reversed":
+            frames.reverse()
+        path = tmp_path / "composition.sqlite3"
+        profile = None if case == "no_profile" else Profile(170.0)
+        with SQLiteMeasurementStore(path) as writer:
+            session_id = writer.create_session(session_id="synthetic", started_at=NOW)
+            writer.append_frames(session_id, frames)
+            writer.complete_session(
+                session_id,
+                ended_at=NOW + timedelta(seconds=1),
+                selected_frame_sequence=None if case == "unselected" else len(frames) - 1,
+                selection_policy_version=None if case == "unselected" else 1,
+            )
+            if case == "unsupported_policy":
+                writer._connection.execute(
+                    "UPDATE measurement_sessions SET selection_policy_version = 2 WHERE id = ?",
+                    (session_id,),
+                )
+                writer._connection.commit()
+            expected = extract_session_telemetry(writer.get_session(session_id), profile)
+
+        with SQLiteMeasurementStore(path, read_only=True) as store:
+            server = create_server(store, profile=profile)
+            async with Client(server, mode="2026-07-28") as client:
+                detail = await client.call_tool("get_session", {"session_id": session_id})
+                latest = await client.call_tool("get_latest_session", {})
+                resource = await client.read_resource(f"tracky://sessions/{session_id}")
+                payload = detail.structured_content
+                assert detail.is_error is False
+                assert payload is not None
+                assert payload == latest.structured_content
+                assert payload == json.loads(resource.contents[0].text)
+                for field in ("composition", "composition_unavailable"):
+                    assert payload[field] == expected[field]
+                if profile is not None:
+                    for field in ("selected", "opaque_block_a", "opaque_block_b"):
+                        assert payload[field] == expected[field]
+                assert payload["composition_unavailable"] == reason
+                assert payload["versions"]["derivation_version"] == DERIVATION_VERSION
+                if case == "valid":
+                    assert payload["composition"]["body_fat_pct"] == 31.5
+                    assert payload["composition"]["trunk_order"] == "transposed"
+
+                # A configured profile does not turn list pagination into full-stream reads.
+                def fail_if_frames_are_loaded(_self: Any, _session_id: str) -> tuple[Any, ...]:
+                    raise AssertionError("list loaded the full frame stream")
+
+                store._load_frames = MethodType(fail_if_frames_are_loaded, store)  # type: ignore[method-assign]
+                listed = await client.call_tool("list_sessions", {})
+                assert listed.is_error is False
+                assert listed.structured_content["sessions"][0]["session_id"] == session_id
 
     asyncio.run(scenario())

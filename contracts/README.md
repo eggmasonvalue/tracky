@@ -1,10 +1,10 @@
 # Linux-to-consumer observation contract
 
-**Status: version 1 is implemented by the Linux canonical store, on-demand MCP projection, authenticated sync API, and Android Health Connect bridge.**
+**Status: version 2 is implemented by the Linux canonical store, on-demand MCP projection, authenticated sync API, and Android Health Connect bridge.**
 
 This is the versioned, read-only observation boundary for MCP and Android. Linux is
-canonical. Android is a consumer and keeps only a minimal import ledger; it is not a
-backup. No user profile or profile attributes cross from Android to Linux.
+canonical and derives body composition; Android is a consumer that keeps only a
+minimal import ledger and is not a backup.
 
 ## Envelope
 
@@ -27,6 +27,8 @@ Every page and observation uses a declared `contract_version` and contains:
   exposed together only when `BurstAssembler` can assemble a wire-valid ordered pair.
   Consumers must preserve and round-trip them without parsing, matching, or assigning
   meaning.
+- `composition` and `composition_unavailable`: Linux-derived body composition, or
+  the reason it is absent. See below.
 
 A selected weight, when present, is structured as `raw`, `divisor`, `unit`, and
 `provenance`. Weight-selection policy version 1 selects the latest frame in a run
@@ -88,50 +90,67 @@ retry and are separate from pagination.
 
 The Android HTTP adapter consumes the authenticated `GET
 /api/v1/sessions/unsynced` projection. Its response declares `contract_version`,
-contains `sessions`, and returns the opaque cursor as `next_cursor`. A retryable
-`source_state` returns no sessions or cursor advancement, including while an
-acquisition session remains open. Each session has the common
-identity/status/timestamp/quality fields and may contain a Linux-selected source
-weight in this shape:
+`versions` (including `derivation_version`, present even on empty pages),
+`sessions`, and the opaque `next_cursor`. A retryable `source_state` returns no
+sessions or cursor advancement, including while an acquisition session remains
+open. Each session may contain a Linux-selected source weight:
 
 ```json
 {
   "selected": {
     "frame_sequence": 12,
-    "weight": {
-      "raw": 7890,
-      "divisor": 100,
-      "unit": "kg",
-      "provenance": "..."
-    }
+    "weight": {"raw": 7890, "divisor": 100, "unit": "kg", "provenance": "..."}
   }
 }
 ```
 
 Android imports only a completed session with a validated selected weight whose
-unit is the declared `kg`. It does not infer a value from raw frames, opaque words,
-`weight_kg` compatibility fields, or any body-composition field. The endpoint must
-be reached through HTTPS and bearer authentication; the Android app ships neither a
+unit is the declared `kg`. It never infers values from raw frames or opaque words.
+The endpoint requires HTTPS and bearer authentication; the app ships neither a
 host-specific endpoint nor a token.
 
-Android imports are idempotent using the Health Connect
-`clientRecordId` + `clientRecordVersion` pair. The pair is the import key: repeating
-an identical pair is a no-op; a newer version may replace the Android projection
-according to the versioned import policy; an older version must not overwrite it.
-The ledger stores only the minimum pair, source session reference, disposition
-(`pending`, `imported`, or `quarantined`), retry/error state, Health Connect record
-ID, and contract/derivation version metadata required for deduplication and audit.
-A separate singleton state row holds the opaque page cursor. Android commits that
-cursor only after every item in the page is imported or durably quarantined; a
-network, permission, timeout, or Health Connect write failure leaves it unchanged.
-It stores no Linux raw evidence, opaque word blocks, profile values, or backup data.
+## Composition
 
-The current Android projection writes only `WeightRecord` and sets
-`derivation_version` to null. The QN SDK-derived channel map and impedance scaling
-are established, but prior work selected only a model structure—not a complete
-published equation with compatible, source-backed coefficients. Until such an
-algorithm is selected and versioned, Android reads (but never writes) the latest
-applicable `HeightRecord`, requests no other profile inputs, and emits no derived
-records. Once added, Android must collect only the algorithm's required
-non-Health-Connect inputs and write every resulting metric that Health Connect
-supports.
+Linux derives composition per `context/DERIVATION.md` from the session's opaque
+blocks, its selected weight, and the Linux profile. It is present only alongside a
+valid selected weight:
+
+```json
+{
+  "composition": {
+    "derivation_version": 2,
+    "trunk_order": "wire",
+    "height_cm": 170.0,
+    "body_fat_pct": 31.5,
+    "lean_body_mass_kg": 48.0,
+    "body_water_kg": 36.67,
+    "bone_mass_kg": 2.73,
+    "protein_kg": 8.58,
+    "skeletal_muscle_kg": 26.42,
+    "basal_metabolic_rate_kcal_per_day": 1406
+  },
+  "composition_unavailable": null
+}
+```
+
+When `composition` is null, `composition_unavailable` is one of `no_weight`,
+`no_impedance`, `impedance_out_of_range`, `limb_frequency_inversion`,
+`no_profile`, or `outside_model_domain`. `trunk_order` is `wire` or `transposed`.
+
+## Health Connect projection
+
+- Record identity per session: `base = "tracky-" + first 32 hex of sha256(session_id)`,
+  with `clientRecordId`s `$base-weight`, `$base-body-fat`, `$base-lean-body-mass`,
+  `$base-body-water-mass`, `$base-bone-mass`, and `$base-bmr`.
+- Every record's `clientRecordVersion` is the page's `derivation_version`.
+  Health Connect replaces a record only when the version is higher.
+- `WeightRecord` is always written. The five derived records are written when
+  composition is present and their write permission is granted; otherwise they are
+  deleted by `clientRecordId`. Only the weight write permission is required.
+- When a page reports a higher `derivation_version` than the ledger has seen,
+  Android resets its cursor and replays the full history.
+- Record time is `started_at_utc` with the device zone's offset at that instant.
+- The ledger stores the record identity and version, source session reference,
+  disposition (`pending`, `imported`, or `quarantined`), retry/error state, all
+  returned Health Connect record IDs, and one cursor row. Android commits the cursor
+  only after every item in the page is imported or durably quarantined.

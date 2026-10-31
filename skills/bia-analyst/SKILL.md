@@ -1,6 +1,6 @@
 ---
 name: bia-analyst
-description: Retrieve and conservatively summarize read-only Tracky MCP history for latest, session-list, or specific-session requests, including capture-backed weight and contract-defined quality; keep opaque word blocks unassigned and do not derive body composition or diagnose.
+description: Retrieve and conservatively summarize read-only Tracky MCP history for latest, session-list, or specific-session requests, including capture-backed weight, Linux-derived composition, and contract-defined quality; keep opaque word blocks unassigned and do not calculate composition or diagnose.
 ---
 
 # Tracky History Analyst (`bia-analyst`)
@@ -77,19 +77,11 @@ The MCP evidence surface deliberately keeps these values opaque even though the 
 
 ## Body-composition boundary
 
-This skill is blocked from deriving body composition. Do not calculate or report body fat, fat mass, fat-free or lean mass, total or segmental water, visceral fat, metabolic age, segmental composition, or similar estimates.
+Report returned `composition` fields with their units and `derivation_version` (currently 2). This is Linux-derived vendor-compatible output, not independent clinical validation. `trunk_order: transposed` means the scale's trunk pair was physically inverted and corrected by Linux; preserve that provenance.
 
-Do not introduce equations, coefficients, threshold ranges, normal ranges, proxy ratios, demographic corrections, or diagnostic claims. The presence of multiple opaque fields, height, age, sex, historical measurements, or a device label does not authorize a calculation.
+If `composition` is null, report the exact `composition_unavailable` reason (`no_profile` when no Linux profile is configured). Request single-session metadata for composition; list summaries remain metadata-only. Do not calculate missing metrics, reinterpret opaque blocks, add normal ranges, or make diagnostic claims.
 
-A derivation implementation may cross this boundary only after a compatible modern equation is selected with all of the following:
-
-1. a version identifier and authoritative source;
-2. a documented input schema and field semantics;
-3. defined quality and applicability rules;
-4. validation evidence for the intended consumer use; and
-5. documented output semantics and limits.
-
-The channel ordering and `raw × 0.1 Ω` protocol conversion are documented in `context/PROTOCOL.md`; the current blocker is the modern equation's exact coefficient provenance. Until that coefficient set is implemented and this skill names its version, remain descriptive and state that body-composition derivation is unavailable.
+**Completion criterion:** composition is quoted as returned with its derivation version and limits, or marked unavailable with the returned reason.
 
 ## Response shape
 
@@ -104,7 +96,8 @@ Choose the smallest response that answers the request while retaining provenance
 - Weight: <returned weight.raw/divisor/unit and provenance, or unavailable>
 - Contract quality: <exact returned quality and quality_version, or unavailable>
 - Opaque blocks: <returned opaque_block_a/b, or not returned>
-- Scope: Capture-backed observations only; opaque semantics and body-composition derivation are unavailable.
+- Composition: <returned fields and derivation_version, or composition_unavailable reason>
+- Scope: Capture-backed observations and Linux-derived vendor-compatible output; not clinical validation.
 ```
 
 Use `get_session_evidence` before filling weight or opaque-block lines when the session metadata response does not return them.

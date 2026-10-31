@@ -105,7 +105,7 @@ umask 022
 python3 -m venv /opt/tracky/venv
 /opt/tracky/venv/bin/python -m pip install --upgrade "$repo/linux[ble,mcp]"
 install -o root -g root -m 0644 "$repo/linux/systemd/tracky.service" "$repo/linux/systemd/tracky-sync.service" /etc/systemd/system/
-printf '%s\n' '#!/bin/sh' 'exec /opt/tracky/venv/bin/tracky-mcp --db-path /var/lib/tracky/tracky.sqlite3 "$@"' >"$work/tracky-mcp"
+printf '%s\n' '#!/bin/sh' 'exec /opt/tracky/venv/bin/tracky-mcp --db-path /var/lib/tracky/tracky.sqlite3 --profile /etc/tracky/profile.toml "$@"' >"$work/tracky-mcp"
 install -o root -g root -m 0755 "$work/tracky-mcp" /usr/local/bin/tracky-mcp
 systemctl daemon-reload
 systemctl enable tracky.service tracky-sync.service

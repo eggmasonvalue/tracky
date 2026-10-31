@@ -67,8 +67,38 @@ parity as vendor compatibility, not independent clinical validation.
 
 Tradeoff: This can restore the intended smart-scale outputs without transplanting
 incompatible academic equations, but reverse engineering is more costly and vendor
-parity alone does not establish physiological accuracy. Derived records remain
-disabled until the recovery and validation gates pass.
+parity alone does not establish physiological accuracy. Derived records are
+enabled only for a derivation version whose outputs match the native library.
+
+Status: active
+
+## 2026-10-31 — Linux derives composition from a Linux-side profile
+
+Context: Deriving on Android duplicated the algorithm in Kotlin, required background Health Connect height reads that silently degraded imports, and hid composition from MCP. Tracky has one user.
+
+Decision: Linux runs the single derivation implementation when serving observations, using a root-managed profile file that holds only height. The sync contract carries the versioned composition; Android writes it and reads nothing from Health Connect.
+
+Tradeoff: Profile data now lives on the appliance and a height change requires editing a file there, but there is one implementation, one test suite, and every consumer sees the same numbers.
+
+Status: active
+
+## 2026-10-31 — Correct a physically inverted trunk pair
+
+Context: Every capture from the current unit reports trunk impedance higher at 100 kHz than at 20 kHz while all four limbs are physically ordered. Tissue impedance cannot rise with frequency. Fed as-is, the vendor regression extrapolates to a markedly higher fat percentage that the vendor app itself rejects in favour of a feet-only estimate; with the pair swapped, the 8-electrode result agrees with that estimate.
+
+Decision: Derivation treats a trunk-only inversion as a transposed pair, swaps it, and records `trunk_order: "transposed"`. Any limb inversion rejects composition instead. Canonical evidence is never rewritten.
+
+Tradeoff: The correction could mask a genuine hardware fault on this unit, but it is gated by physics, visible in every result, and reversible by a derivation-version bump. A unit with an ordered trunk never triggers it.
+
+Status: active
+
+## 2026-10-31 — Derivation version drives Health Connect record versions
+
+Context: Derived values must be correctable after import without duplicating records or wiping Health Connect.
+
+Decision: Each session maps to fixed per-type `clientRecordId`s, and every record's `clientRecordVersion` is the derivation version. A higher version makes Android replay history from an empty cursor; sessions without composition have their derived records deleted.
+
+Tradeoff: A version bump rewrites the whole history on the phone, which is cheap for one user and keeps Health Connect an exact projection.
 
 Status: active
 
@@ -80,7 +110,7 @@ Decision: Android reads the latest applicable height from Health Connect and nev
 
 Tradeoff: Some local user input remains necessary before profile-dependent derivation can run.
 
-Status: active
+Status: superseded by 2026-10-31 — Linux derives composition from a Linux-side profile
 
 ## 2026-09-16 — Android keeps an import ledger, not a backup
 

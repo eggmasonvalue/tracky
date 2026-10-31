@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from tracky_mcp.protocol import BurstAssembler, MeasurementFrame, decode_frame
+from tracky_mcp.derivation import DERIVATION_VERSION, Profile
 from tracky_mcp.storage import (
     AcquisitionOperation,
     KnownDevice,
@@ -15,6 +15,7 @@ from tracky_mcp.storage import (
     MeasurementSessionSummary,
     StoredFrame,
 )
+from tracky_mcp.sync_server import _composition, _opaque_blocks, _selected_weight
 
 CONTRACT_VERSION = 1
 TRANSPORT_VERSION = 1
@@ -98,6 +99,7 @@ class ContractVersions(BaseModel):
     decoder_versions: list[int]
     selection_policy_version: int = SELECTION_POLICY_VERSION
     quality_version: int
+    derivation_version: int = DERIVATION_VERSION
 
 
 class ErrorDetail(BaseModel):
@@ -275,29 +277,6 @@ def _frame_references(session_id: str, count: int) -> list[FrameReference]:
     ]
 
 
-def _opaque_blocks(session: MeasurementSession) -> tuple[list[int] | None, list[int] | None]:
-    """Return only the latest pair assembled by the wire-valid burst rules."""
-
-    assembler = BurstAssembler()
-    for stored_frame in session.frames:
-        if stored_frame.direction != "rx":
-            continue
-        try:
-            decoded = decode_frame(stored_frame.raw)
-        except ValueError:
-            assembler.interrupt()
-            continue
-        if isinstance(decoded, MeasurementFrame):
-            assembler.add(decoded)
-        else:
-            assembler.interrupt()
-
-    if not assembler.completed:
-        return None, None
-    burst = assembler.completed[-1]
-    return list(burst.block_a), list(burst.block_b)
-
-
 def _selected_evidence(session: SessionRecord) -> SelectedEvidence | None:
     if isinstance(session, MeasurementSessionSummary):
         if session.selected_frame_sequence is None:
@@ -417,16 +396,28 @@ class SessionResource(BaseModel):
     quality_version: int | None = None
     opaque_block_a: list[int] | None = None
     opaque_block_b: list[int] | None = None
+    composition: dict[str, Any] | None = None
+    composition_unavailable: str | None = None
     error: ErrorDetail | None = None
 
     @classmethod
-    def from_record(cls, session: SessionRecord) -> SessionResource:
+    def from_record(
+        cls, session: SessionRecord, profile: Profile | None = None
+    ) -> SessionResource:
         summary = SessionSummary.from_record(session)
         if isinstance(session, MeasurementSession):
             block_a, block_b = _opaque_blocks(session)
         else:
             block_a = block_b = None
         selected = _selected_evidence(session)
+        composition = None
+        unavailable = "no_profile"
+        if profile is not None and isinstance(session, MeasurementSession):
+            sync_selected = _selected_weight(session)
+            selected = (
+                SelectedEvidence.model_validate(sync_selected) if sync_selected else None
+            )
+            composition, unavailable = _composition(sync_selected, block_a, block_b, profile)
         return cls(
             session_id=session.id,
             summary=summary,
@@ -441,6 +432,8 @@ class SessionResource(BaseModel):
             quality_version=summary.quality_version,
             opaque_block_a=block_a,
             opaque_block_b=block_b,
+            composition=composition,
+            composition_unavailable=unavailable,
         )
 
 

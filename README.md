@@ -10,7 +10,7 @@ Scale → Linux acquisition appliance → SQLite system of record
                                   └→ Android bridge → Health Connect
 ```
 
-Linux is the only BLE and scale-protocol owner. MCP reads captured history for agents. Android is a non-launcher background projection: it synchronizes canonical observations with authenticated HTTPS, reads (but never writes) Health Connect height, and writes idempotent records. Weight projection is implemented. Derived metrics remain disabled until the exact QN scale-family formulas are recovered with traceable coefficients, applicability rules, and vendor-output parity tests.
+Linux is the only BLE and scale-protocol owner, and it derives body composition from a Linux-side profile. MCP reads captured history and composition for agents. Android is a non-launcher background writer: it synchronizes Linux observations over authenticated HTTPS and writes weight, body fat, lean body mass, body water mass, bone mass, and basal metabolic rate to Health Connect. Derived values are a vendor-compatible reimplementation of the QN scale-family algorithm, parity-tested against the native library; see [`context/DERIVATION.md`](context/DERIVATION.md).
 
 See:
 
@@ -18,16 +18,16 @@ See:
 - [`context/DECISIONS.md`](context/DECISIONS.md) — durable tradeoffs
 - [`context/CONVENTIONS.md`](context/CONVENTIONS.md) — coding and verification rules
 - [`context/PROTOCOL.md`](context/PROTOCOL.md) — evidence-graded protocol knowledge
-- [`context/DERIVATION.md`](context/DERIVATION.md) — BIA inputs and coefficient-validation handoff
-- [`contracts/README.md`](contracts/README.md) — target cross-component contract
-- [`context/DEPLOYMENT.md`](context/DEPLOYMENT.md) — target deployment
+- [`context/DERIVATION.md`](context/DERIVATION.md) — body-composition derivation
+- [`contracts/README.md`](contracts/README.md) — cross-component contract
+- [`context/DEPLOYMENT.md`](context/DEPLOYMENT.md) — installation and operations
 
 ## Repository
 
 ```text
-android/    Non-launcher Android Health Connect projection and import ledger
-linux/      Python BlueZ acquisition, SQLite, sync API, and MCP implementation
-contracts/  Shared observation contract; schema/fixture integration pending
+android/    Non-launcher Android Health Connect writer and import ledger
+linux/      Python BlueZ acquisition, SQLite, derivation, sync API, MCP, units, installer
+contracts/  Shared observation contract
 skills/     Agent-facing analysis skill
 context/    Canonical project map, decisions, conventions, and focused references
 ```
@@ -50,7 +50,7 @@ cd android
 ./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
-The current branch is an architectural migration, not a deployment-ready release. Android has no ordinary launcher entry; Health Connect opens its rationale/onboarding surface. Configure an HTTPS endpoint and bearer token through that surface. Run `todo list` for current implementation work.
+Deployment: see [`context/DEPLOYMENT.md`](context/DEPLOYMENT.md). Android has no launcher entry; open onboarding with `adb shell am start -n dev.eggmasonvalue.tracky/.MainActivity` or from Health Connect's app permissions.
 
 ## License
 

@@ -6,7 +6,8 @@
 - Keep MCP on-demand and read-only.
 - Keep Android free of BLE, scale-protocol, and canonical evidence storage.
 - Put cross-component schemas and semantics under `contracts/`.
-- Keep user profile data on Android.
+- Keep the user profile on Linux in `/etc/tracky/profile.toml`; consumers receive only derived results.
+- Derive composition only in `linux/src/tracky_mcp/derivation.py`; bump `DERIVATION_VERSION` for any change to its output.
 
 ## Evidence
 

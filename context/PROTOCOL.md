@@ -105,21 +105,15 @@ derivation layer and must not rewrite canonical evidence.
 
 ## Derivation status
 
-The intended derivation class uses segmental multi-frequency
-height-squared-over-impedance predictors, with weight, age, and biological sex where
-required. Channel mapping and impedance scaling are established inputs; coefficient
-selection is the outstanding problem.
+Derivation version 2 reimplements the QN scale-family composition path with
+native-library parity and is specified in `DERIVATION.md`. Height is the only
+profile input it needs; sex and age affect only vendor outputs Tracky does not emit.
 
-No exact modern equation was selected during prior research. The earlier phrase
-"Segmental Multi-Frequency Sum-of-Segments model" described a model structure, not
-a published consensus formula with universal coefficients. Earlier Android and
-skill implementations supplied conflicting, unsupported numbers and are rejected.
-Yolanda's dated proprietary composition algorithm is not the target. Before
-restoring derived metrics, select a modern published equation compatible with the
-available 20/100 kHz segmental inputs and record its exact coefficients, primary
-source, calibration population, applicability limits, and uncertainty. See
-`DERIVATION.md`. Use one versioned coefficient set across consumers, reject
-out-of-scope inputs explicitly, and never clamp output.
+On the current unit, every capture reports trunk impedance higher at 100 kHz than
+at 20 kHz while all limbs are ordered (E3). Tissue impedance cannot rise with
+frequency, so derivation treats the trunk pair as transposed; see `DECISIONS.md`.
+Whether this is a unit fault or a model-wide firmware ordering is unresolved until
+another unit is captured.
 
 ## Contact, foot-only, and completion quality
 
