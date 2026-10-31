@@ -1,0 +1,34 @@
+[Unit]
+Description=Tracky zero-touch BlueZ acquisition
+After=bluetooth.service
+Wants=bluetooth.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tracky
+Group=tracky
+ExecStart=/opt/tracky/venv/bin/tracky-daemon --db-path /var/lib/tracky/tracky.sqlite3
+StateDirectory=tracky
+StateDirectoryMode=0750
+UMask=0027
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

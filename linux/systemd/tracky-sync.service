@@ -1,0 +1,35 @@
+[Unit]
+Description=Tracky authenticated TLS observation API
+After=tracky.service network.target
+Wants=tracky.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tracky
+Group=tracky
+ExecStart=/opt/tracky/venv/bin/tracky-sync-server --host 0.0.0.0 --port 8765 --db-path /var/lib/tracky/tracky.sqlite3 --token-file /etc/tracky/token --tls-cert-file /etc/tracky/tls/server.crt --tls-key-file /etc/tracky/tls/server.key --profile /etc/tracky/profile.toml
+StateDirectory=tracky
+StateDirectoryMode=0750
+ReadOnlyPaths=/var/lib/tracky
+UMask=0027
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
